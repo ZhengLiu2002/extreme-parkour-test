@@ -214,34 +214,23 @@ class Terrain:
         gap_size = 1.0 * difficulty
         pit_depth = 1.0 * difficulty
 
-        # ========== 【优化版】4阶段课程学习逻辑 ==========
-        # 关键修复：保持 num_hurdles 固定为 4，只改变 height_range
-        # 这样确保所有环境的 actor 数量一致，避免张量视图错误
-        #
-        # difficulty 由 Isaac Gym 的课程学习机制（基于 terrain_levels）传入
-        # terrain_levels 从 0 到 num_rows-1，映射到 difficulty 0.0 到 1.0
-
-        # 【关键】固定栏杆数量，确保 actor 数量一致
         num_hurdles = 4
-
-        # 根据 difficulty 动态设置栏杆高度范围
         if difficulty < 0.25:
             # 阶段1：平地行走 (difficulty: 0.0 - 0.25)
-            # 【优化】使用极低高度（5cm），让机器人学习基本行走
-            # 而不是完全0高度（可能导致穿模问题）
+            # 使用极低高度（5cm-8cm可通过高度），让机器人学习基本行走
             height_range = [0.05, 0.08]
         elif difficulty < 0.5:
-            # 阶段2：学习钻爬 (difficulty: 0.25 - 0.5)
-            # 只生成高栏杆（40-50cm），机器人必须钻过
-            height_range = [0.4, 0.5]
+            # 阶段2：学习跳跃/攀爬 (difficulty: 0.25 - 0.5)
+            # 生成低中栏杆（20-35cm可通过高度），鼓励机器人跳跃或爬过
+            height_range = [0.20, 0.35]
         elif difficulty < 0.75:
-            # 阶段3：学习跨越 (difficulty: 0.5 - 0.75)
-            # 只生成低栏杆（20-30cm），鼓励机器人跨越
-            height_range = [0.2, 0.3]
+            # 阶段3：学习钻爬 (difficulty: 0.5 - 0.75)
+            # 生成高栏杆（35-50cm可通过高度），机器人必须钻过
+            height_range = [0.35, 0.50]
         else:
             # 阶段4：混合策略 (difficulty: 0.75 - 1.0)
-            # 生成所有高度的栏杆，机器人需要自主选择策略
-            height_range = [0.2, 0.5]
+            # 生成所有高度的栏杆（20-50cm可通过高度），机器人需要自主选择策略
+            height_range = [0.20, 0.50]
 
         # H型栏杆地形 - 唯一的地形类型
         if choice < self.proportions[0]:
@@ -256,7 +245,7 @@ class Terrain:
                 height_range=height_range,  # 根据课程学习阶段动态决定
                 pad_height=0,
                 progressive_heights=False,  # 禁用递进高度，改用动态height_range
-                post_spacing=0.7,  # 两根立柱之间的间距70cm
+                post_spacing=0.5,  # 两根立柱之间的间距（内侧距离）50cm
                 crossbar_inset=0.05,  # 横梁向内缩进5cm
             )
             self.add_roughness(terrain)
@@ -272,7 +261,7 @@ class Terrain:
                 height_range=height_range,
                 pad_height=0,
                 progressive_heights=False,
-                post_spacing=0.7,  # 两根立柱之间的间距70cm
+                post_spacing=0.5,  # 两根立柱之间的间距（内侧距离）50cm
                 crossbar_inset=0.05,  # 横梁向内缩进5cm
             )
             self.add_roughness(terrain)
@@ -846,11 +835,11 @@ def h_hurdle_terrain(
     total_goals=None,
     x_range=[1.5, 2.5],
     y_range=[0.0, 0.0],
-    height_range=[0.2, 0.5],
+    height_range=[0.2, 0.5],  # 可通过高度范围（上横杆下端到下横杆上端）
     pad_width=0.1,
     pad_height=0.5,
     progressive_heights=True,
-    post_spacing=0.7,
+    post_spacing=0.5,  # 两根立柱内侧距离（宽度）
     crossbar_inset=0.0,
 ):
 
@@ -917,15 +906,15 @@ def h_hurdle_terrain(
         # 计算栏杆的Y轴偏移
         rand_y = np.random.randint(dis_y_min, dis_y_max) if dis_y_max > dis_y_min else 0
 
-        # 选择当前栏杆的高度
+        # 选择当前栏杆的可通过高度（上横杆下端到下横杆上端的距离）
         if progressive_heights and i < len(progressive_sequence):
             # 使用递进高度序列（旧版逻辑）
-            hurdle_height = progressive_sequence[i]
+            passable_height = progressive_sequence[i]
         else:
             # 【优化】直接在传入的 height_range [min, max] 之间随机取值
             # 这确保了无论 height_range 是什么，都能得到一个有效的高度
             # 并且高度分布更连续（不再局限于 [0.2, 0.3, 0.4, 0.5]）
-            hurdle_height = np.random.uniform(height_range[0], height_range[1])
+            passable_height = np.random.uniform(height_range[0], height_range[1])
 
         # 计算栏杆在世界坐标系中的中心位置
         hurdle_x = dis_x * terrain.horizontal_scale
@@ -938,24 +927,35 @@ def h_hurdle_terrain(
         right_post_y = hurdle_y + post_spacing / 2  # 右侧立柱
 
         # 底部横杆参数
-        bottom_bar_height = 0.05  # 底部横杆高度（5cm，用来绊倒机器人）
+        bottom_bar_height = 0.05  # 底部横杆中心高度（5cm）
         bottom_bar_offset_x = 0.0  # 底部横杆在X轴前移0cm（避免与立柱连接成墙）
-        bottom_bar_radius = 0.005  # 底部横杆半径（1cm）
-        # 【修复】底部横杆长度也应该与立柱间距一致，略短一点避免穿模
-        bottom_bar_length = post_spacing - 0.1  # 比立柱间距短10cm
-        crossbar_height = hurdle_height + post_radius
+        bottom_bar_radius = 0.005  # 底部横杆半径（0.5cm）
+        # 【修复】底部横杆长度应该与立柱间距一致
+        bottom_bar_length = post_spacing
+
+        # 【关键修正】根据可通过高度计算顶部横杆和立柱高度
+        # 定义：可通过高度 = 上横杆下端 - 下横杆上端
+        # 即：passable_height = (crossbar_height - crossbar_radius) - (bottom_bar_height + bottom_bar_radius)
+        # 推导：crossbar_height = passable_height + bottom_bar_height + bottom_bar_radius + crossbar_radius
+        crossbar_height = (
+            passable_height + bottom_bar_height + bottom_bar_radius + crossbar_radius
+        )
+
+        # 立柱高度到横杆中心（即crossbar_height）
+        post_height = crossbar_height
 
         # 存储H型栏杆的完整几何信息
         hurdle_info = {
             "x": hurdle_x,
             "y": hurdle_y,
             "z": hurdle_z,
-            "height": hurdle_height,  # 栏杆总高度
-            "post_spacing": post_spacing,  # 立柱间距
+            "height": post_height,  # 栏杆总高度（立柱高度）
+            "passable_height": passable_height,  # 可通过高度（上横杆下端到下横杆上端）
+            "post_spacing": post_spacing,  # 立柱内侧间距（宽度）
             # 立柱信息（两根垂直圆柱）
             "posts": {
                 "radius": post_radius,
-                "height": hurdle_height,  # 立柱高度等于栏杆高度
+                "height": post_height,  # 立柱高度
                 "left_y": left_post_y,  # 左侧立柱的Y坐标
                 "right_y": right_post_y,  # 右侧立柱的Y坐标
                 "color": [0.3, 0.3, 0.3],  # 深灰色
@@ -963,17 +963,17 @@ def h_hurdle_terrain(
             # 顶部横梁信息（悬空的水平圆柱，与立柱顶端平齐）
             "crossbar": {
                 "radius": crossbar_radius,
-                "length": crossbar_length,  # 横梁长度（小于立柱间距）
-                "height": crossbar_height,  # 横梁Z坐标（与立柱顶端平齐）
+                "length": crossbar_length,  # 横梁长度（等于立柱间距）
+                "height": crossbar_height,  # 横梁Z坐标（中心高度）
                 "inset": crossbar_inset,  # 横梁向内缩进距离
                 "color": [0.8, 0.2, 0.2],  # 红色
             },
             # 底部横杆信息（用来绊倒机器人，与横梁平行）
             "bottom_bar": {
                 "radius": bottom_bar_radius,
-                "length": bottom_bar_length,  # 与顶部横梁长度相同
-                "height": bottom_bar_height,  # 距离地面10cm
-                "offset_x": bottom_bar_offset_x,  # 在X轴前移8cm
+                "length": bottom_bar_length,  # 底部横杆长度（等于立柱间距）
+                "height": bottom_bar_height,  # 底部横杆中心高度（5cm）
+                "offset_x": bottom_bar_offset_x,  # 在X轴偏移
                 "color": [0.2, 0.8, 0.2],  # 绿色
             },
         }

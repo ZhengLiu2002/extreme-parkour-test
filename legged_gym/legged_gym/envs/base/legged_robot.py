@@ -354,6 +354,68 @@ class LeggedRobot(BaseTask):
     def reindex(self, vec):
         return vec[:, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]]
 
+    def _check_stuck(self):
+        """
+        检测机器人是否被栏杆卡住
+
+        判断标准（更严格，减少误判）：
+        1. 机器人X轴前进距离很小（只检查前进方向）
+        2. 持续较长时间（避免误判正常调整姿态）
+        3. 同时有较大的接触力（说明确实被卡住而不是在等待）
+
+        Returns:
+            torch.Tensor: 布尔张量，指示哪些环境的机器人被卡住
+        """
+        # 获取配置参数
+        stuck_distance_threshold = getattr(
+            self.cfg.env, "stuck_distance_threshold", 0.02
+        )  # 2cm (更严格，只检查X轴前进)
+        stuck_time_threshold = getattr(
+            self.cfg.env, "stuck_time_threshold", 200
+        )  # 200步 (约1秒 @ 200Hz，减少误判)
+
+        # 计算当前位置
+        current_position = self.root_states[:, :3]
+
+        # 只检查X轴（前进方向）的位置变化
+        forward_distance = torch.abs(current_position[:, 0] - self.last_position[:, 0])
+
+        # 检测是否前进很少
+        is_barely_moving_forward = forward_distance < stuck_distance_threshold
+
+        # 【新增】检查是否有较大的身体接触力（被卡住的信号）
+        # 如果没有接触力，说明机器人可能只是在调整姿态，不是被卡住
+        if (
+            hasattr(self, "penalised_contact_indices")
+            and len(self.penalised_contact_indices) > 0
+        ):
+            body_contact_forces = self.contact_forces[
+                :, self.penalised_contact_indices, :
+            ]
+            contact_force_magnitude = torch.norm(body_contact_forces, dim=-1).sum(dim=1)
+            has_contact = contact_force_magnitude > 10.0  # 有明显接触力
+        else:
+            has_contact = torch.ones(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+
+        # 只有同时满足"不动"和"有接触力"才计数
+        is_stuck_candidate = is_barely_moving_forward & has_contact
+
+        # 更新计数器
+        self.stuck_detection_counter[is_stuck_candidate] += 1
+        self.stuck_detection_counter[~is_stuck_candidate] = 0
+
+        # 每隔一段时间更新参考位置（而不是每步都更新）
+        # 这样可以更好地检测长期趋势
+        if self.common_step_counter % 10 == 0:  # 每10步更新一次参考位置
+            self.last_position[:] = current_position
+
+        # 判断是否卡住（持续时间超过阈值）
+        is_stuck = self.stuck_detection_counter > stuck_time_threshold
+
+        return is_stuck
+
     def check_termination(self):
         """Check if environments need to be reset"""
         self.reset_buf = torch.zeros(
@@ -364,6 +426,9 @@ class LeggedRobot(BaseTask):
         reach_goal_cutoff = self.cur_goal_idx >= self.cfg.terrain.num_goals
         height_cutoff = self.root_states[:, 2] < -0.25
 
+        # 【新增】卡住检测
+        stuck_cutoff = self._check_stuck()
+
         self.time_out_buf = (
             self.episode_length_buf > self.max_episode_length
         )  # no terminal reward for time-outs
@@ -373,6 +438,7 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= roll_cutoff
         self.reset_buf |= pitch_cutoff
         self.reset_buf |= height_cutoff
+        self.reset_buf |= stuck_cutoff
 
     def reset_idx(self, env_ids):
         """Reset some environments.
@@ -415,6 +481,10 @@ class LeggedRobot(BaseTask):
         self.action_history_buf[env_ids, :, :] = 0.0
         self.cur_goal_idx[env_ids] = 0
         self.reach_goal_timer[env_ids] = 0
+
+        # 【新增】重置卡住检测相关的缓冲区
+        self.stuck_detection_counter[env_ids] = 0
+        self.last_position[env_ids] = self.root_states[env_ids, :3]
 
         # 【新增】更新重置环境的静态障碍物信息
         # 当环境重置时，获取该环境对应的 (row, col) 的栏杆信息
@@ -879,7 +949,7 @@ class LeggedRobot(BaseTask):
             env_ids (List[int]): Environemnt ids
         """
         self.dof_pos[env_ids] = self.default_dof_pos + torch_rand_float(
-            0.0, 0.9, (len(env_ids), self.num_dof), device=self.device
+            -0.2, 0.2, (len(env_ids), self.num_dof), device=self.device
         )
         self.dof_vel[env_ids] = 0.0
 
@@ -1008,12 +1078,19 @@ class LeggedRobot(BaseTask):
             # don't change on initial reset
             return
 
-        dis_to_origin = torch.norm(
-            self.root_states[env_ids, :2] - self.env_origins[env_ids, :2], dim=1
+        # 【关键修复】对于栏杆任务，使用目标点完成率而不是前进距离
+        # 原因：
+        # 1. 栏杆任务总共约8-10米，但threshold计算需要6-20米
+        # 2. 前进距离判断导致terrain_level永远不变
+        # 3. 目标点完成率更直接反映任务完成度
+        goal_completion_rate = (
+            self.cur_goal_idx[env_ids].float() / self.cfg.terrain.num_goals
         )
-        threshold = self.commands[env_ids, 0] * self.cfg.env.episode_length_s
-        move_up = dis_to_origin > 0.8 * threshold
-        move_down = dis_to_origin < 0.4 * threshold
+
+        # 通过50%以上的目标点 -> 提升难度
+        move_up = goal_completion_rate > 0.5
+        # 通过不到20%的目标点 -> 降低难度
+        move_down = goal_completion_rate < 0.2
 
         self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
         # # Robots that solve the last level are sent to a random one
@@ -1192,6 +1269,22 @@ class LeggedRobot(BaseTask):
             device=self.device,
             requires_grad=False,
         )
+
+        # 【新增】卡住检测相关的缓冲区
+        self.stuck_detection_counter = torch.zeros(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+            requires_grad=False,
+        )
+        self.last_position = torch.zeros(
+            self.num_envs,
+            3,
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
+
         self.base_lin_vel = quat_rotate_inverse(
             self.base_quat, self.root_states[:, 7:10]
         )
@@ -1508,15 +1601,15 @@ class LeggedRobot(BaseTask):
             self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
             # 使用更大的filter值确保碰撞生效
             robot_collision_filter = -1  # 使用-1作为全1位掩码（32位有符号整数）
-            if i == 0:  # 只在第一个环境打印，避免过多输出
-                print(f"[DEBUG] 创建机器人 Actor (env={i}):")
-                print(f"  - collision_group = {i}")
-                print(
-                    f"  - collision_filter = {robot_collision_filter} (二进制全1，32位整数)"
-                )
-                # 检查资产的形状数量
-                num_shapes = self.gym.get_asset_rigid_shape_count(robot_asset)
-                print(f"  - 机器人资产碰撞形状数量: {num_shapes}")
+            # if i == 0:  # 只在第一个环境打印，避免过多输出
+            #     print(f"[DEBUG] 创建机器人 Actor (env={i}):")
+            #     print(f"  - collision_group = {i}")
+            #     print(
+            #         f"  - collision_filter = {robot_collision_filter} (二进制全1，32位整数)"
+            #     )
+            #     # 检查资产的形状数量
+            #     num_shapes = self.gym.get_asset_rigid_shape_count(robot_asset)
+            #     print(f"  - 机器人资产碰撞形状数量: {num_shapes}")
 
             # Isaac Gym API: create_actor(env, asset, pose, name, group, filter, segmentationId)
             # group: 碰撞组，相同组的actor会碰撞
@@ -1533,23 +1626,23 @@ class LeggedRobot(BaseTask):
             )
 
             # 验证创建后的actor属性（仅第一个环境）
-            if i == 0:
-                # 获取actor的刚体数量
-                num_bodies = self.gym.get_actor_rigid_body_count(
-                    env_handle, anymal_handle
-                )
-                print(f"  - 机器人Actor刚体数量: {num_bodies}")
-                # 获取actor的碰撞形状数量
-                num_actor_shapes = 0
-                for body_idx in range(num_bodies):
-                    body_shape_props = self.gym.get_actor_rigid_shape_properties(
-                        env_handle, anymal_handle
-                    )
-                    if body_idx < len(body_shape_props):
-                        num_actor_shapes += 1
-                print(
-                    f"  - 机器人Actor碰撞形状数量: {len(body_shape_props) if num_bodies > 0 else 0}"
-                )
+            # if i == 0:
+            #     # 获取actor的刚体数量
+            #     num_bodies = self.gym.get_actor_rigid_body_count(
+            #         env_handle, anymal_handle
+            #     )
+            #     print(f"  - 机器人Actor刚体数量: {num_bodies}")
+            #     # 获取actor的碰撞形状数量
+            #     num_actor_shapes = 0
+            #     for body_idx in range(num_bodies):
+            #         body_shape_props = self.gym.get_actor_rigid_shape_properties(
+            #             env_handle, anymal_handle
+            #         )
+            #         if body_idx < len(body_shape_props):
+            #             num_actor_shapes += 1
+            #     print(
+            #         f"  - 机器人Actor碰撞形状数量: {len(body_shape_props) if num_bodies > 0 else 0}"
+            #     )
 
             dof_props = self._process_dof_props(dof_props_asset, i)
             self.gym.set_actor_dof_properties(env_handle, anymal_handle, dof_props)
@@ -1677,11 +1770,11 @@ class LeggedRobot(BaseTask):
             virtual_crossbars.append(crossbar_info)
 
         self.terrain.virtual_crossbars = virtual_crossbars
-        print(f"[虚拟横杆] 已创建 {len(virtual_crossbars)} 个虚拟横杆用于奖励计算")
-        for i, cb in enumerate(virtual_crossbars):
-            print(
-                f"  横杆{i+1}: x={cb['x']:.2f}m, y={cb['y']:.2f}m, 高度={cb['height']:.2f}m, 宽度={cb['width']:.2f}m"
-            )
+        # print(f"[虚拟横杆] 已创建 {len(virtual_crossbars)} 个虚拟横杆用于奖励计算")
+        # for i, cb in enumerate(virtual_crossbars):
+        #     print(
+        #         f"  横杆{i+1}: x={cb['x']:.2f}m, y={cb['y']:.2f}m, 高度={cb['height']:.2f}m, 宽度={cb['width']:.2f}m"
+        #     )
 
     def _create_gate_assets(self):
         """创建门框几何体assets（立柱和横梁）"""
@@ -1944,23 +2037,23 @@ class LeggedRobot(BaseTask):
                 )
 
         # 障碍物创建完成后的总结（仅第一个环境）
-        if env_id == 0 and hurdles_world:
-            num_hurdles = len(hurdles_world)
-            num_obstacles = (
-                num_hurdles * 4
-            )  # 每个hurdle有4个组件：2个立柱 + 1个横梁 + 可选的底部横杆
-            print(f"[DEBUG] 环境{env_id}障碍物创建完成:")
-            print(f"  - H型栏杆数量: {num_hurdles}")
-            print(f"  - 总障碍物组件数: {num_obstacles}")
-            print(
-                f"  - 所有障碍物使用: collision_group={env_id}, collision_filter=-1 (全1位掩码)"
-            )
-            print(
-                f"  - 机器人使用: collision_group={env_id}, collision_filter=-1 (全1位掩码)"
-            )
-            print(
-                f"  - 碰撞配置验证: 机器人和障碍物在同一group且filter匹配（-1 & -1 = -1 ≠ 0），应该能碰撞 ✓"
-            )
+        # if env_id == 0 and hurdles_world:
+        #     num_hurdles = len(hurdles_world)
+        #     num_obstacles = (
+        #         num_hurdles * 4
+        #     )  # 每个hurdle有4个组件：2个立柱 + 1个横梁 + 可选的底部横杆
+        #     print(f"[DEBUG] 环境{env_id}障碍物创建完成:")
+        #     print(f"  - H型栏杆数量: {num_hurdles}")
+        #     print(f"  - 总障碍物组件数: {num_obstacles}")
+        #     print(
+        #         f"  - 所有障碍物使用: collision_group={env_id}, collision_filter=-1 (全1位掩码)"
+        #     )
+        #     print(
+        #         f"  - 机器人使用: collision_group={env_id}, collision_filter=-1 (全1位掩码)"
+        #     )
+        #     print(
+        #         f"  - 碰撞配置验证: 机器人和障碍物在同一group且filter匹配（-1 & -1 = -1 ≠ 0），应该能碰撞 ✓"
+        #     )
 
     def _add_cylinder_geometry(
         self, env_handle, env_id, pos, radius, length, color, vertical=True
@@ -2018,17 +2111,17 @@ class LeggedRobot(BaseTask):
         obstacle_collision_filter = -1  # 使用-1作为全1位掩码（32位有符号整数）
 
         # 调试信息：检查资产的碰撞形状
-        num_shapes = self.gym.get_asset_rigid_shape_count(cylinder_asset)
-        if env_id == 0:  # 只在第一个环境打印，避免过多输出
-            print(f"[DEBUG] 创建圆柱障碍物 (env={env_id}):")
-            print(f"  - collision_group = {env_id}")
-            print(
-                f"  - collision_filter = {obstacle_collision_filter} (二进制全1，32位整数)"
-            )
-            print(f"  - self_collisions = 0")
-            print(f"  - 圆柱资产碰撞形状数量: {num_shapes}")
-            print(f"  - 位置: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
-            print(f"  - 半径: {radius:.3f}, 长度: {length:.3f}")
+        # num_shapes = self.gym.get_asset_rigid_shape_count(cylinder_asset)
+        # if env_id == 0:  # 只在第一个环境打印，避免过多输出
+        #     print(f"[DEBUG] 创建圆柱障碍物 (env={env_id}):")
+        #     print(f"  - collision_group = {env_id}")
+        #     print(
+        #         f"  - collision_filter = {obstacle_collision_filter} (二进制全1，32位整数)"
+        #     )
+        #     print(f"  - self_collisions = 0")
+        #     print(f"  - 圆柱资产碰撞形状数量: {num_shapes}")
+        #     print(f"  - 位置: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
+        #     print(f"  - 半径: {radius:.3f}, 长度: {length:.3f}")
 
         actor_handle = self.gym.create_actor(
             env_handle,
@@ -2041,15 +2134,15 @@ class LeggedRobot(BaseTask):
         )
 
         # 验证创建后的actor属性（仅第一个环境）
-        if env_id == 0:
-            num_bodies = self.gym.get_actor_rigid_body_count(env_handle, actor_handle)
-            body_shape_props = self.gym.get_actor_rigid_shape_properties(
-                env_handle, actor_handle
-            )
-            print(f"  - 圆柱障碍物Actor刚体数量: {num_bodies}")
-            print(f"  - 圆柱障碍物Actor碰撞形状数量: {len(body_shape_props)}")
-            if len(body_shape_props) > 0:
-                print(f"  - 第一个形状类型: {type(body_shape_props[0])}")
+        # if env_id == 0:
+        #     num_bodies = self.gym.get_actor_rigid_body_count(env_handle, actor_handle)
+        #     body_shape_props = self.gym.get_actor_rigid_shape_properties(
+        #         env_handle, actor_handle
+        #     )
+        #     print(f"  - 圆柱障碍物Actor刚体数量: {num_bodies}")
+        #     print(f"  - 圆柱障碍物Actor碰撞形状数量: {len(body_shape_props)}")
+        #     if len(body_shape_props) > 0:
+        #         print(f"  - 第一个形状类型: {type(body_shape_props[0])}")
 
         # 存储actor句柄，便于后续管理
         self.static_obstacle_handles.append(actor_handle)
@@ -2101,17 +2194,17 @@ class LeggedRobot(BaseTask):
         obstacle_collision_filter = -1  # 使用-1作为全1位掩码（32位有符号整数）
 
         # 调试信息：检查资产的碰撞形状
-        num_shapes = self.gym.get_asset_rigid_shape_count(box_asset)
-        if env_id == 0:  # 只在第一个环境打印，避免过多输出
-            print(f"[DEBUG] 创建长方体障碍物 (env={env_id}):")
-            print(f"  - collision_group = {env_id}")
-            print(
-                f"  - collision_filter = {obstacle_collision_filter} (二进制全1，32位整数)"
-            )
-            print(f"  - self_collisions = 0")
-            print(f"  - 长方体资产碰撞形状数量: {num_shapes}")
-            print(f"  - 位置: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
-            print(f"  - 尺寸: X={length_x:.3f}, Y={length_y:.3f}, Z={length_z:.3f}")
+        # num_shapes = self.gym.get_asset_rigid_shape_count(box_asset)
+        # if env_id == 0:  # 只在第一个环境打印，避免过多输出
+        #     print(f"[DEBUG] 创建长方体障碍物 (env={env_id}):")
+        #     print(f"  - collision_group = {env_id}")
+        #     print(
+        #         f"  - collision_filter = {obstacle_collision_filter} (二进制全1，32位整数)"
+        #     )
+        #     print(f"  - self_collisions = 0")
+        #     print(f"  - 长方体资产碰撞形状数量: {num_shapes}")
+        #     print(f"  - 位置: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
+        #     print(f"  - 尺寸: X={length_x:.3f}, Y={length_y:.3f}, Z={length_z:.3f}")
 
         actor_handle = self.gym.create_actor(
             env_handle,
@@ -2124,15 +2217,15 @@ class LeggedRobot(BaseTask):
         )
 
         # 验证创建后的actor属性（仅第一个环境）
-        if env_id == 0:
-            num_bodies = self.gym.get_actor_rigid_body_count(env_handle, actor_handle)
-            body_shape_props = self.gym.get_actor_rigid_shape_properties(
-                env_handle, actor_handle
-            )
-            print(f"  - 长方体障碍物Actor刚体数量: {num_bodies}")
-            print(f"  - 长方体障碍物Actor碰撞形状数量: {len(body_shape_props)}")
-            if len(body_shape_props) > 0:
-                print(f"  - 第一个形状类型: {type(body_shape_props[0])}")
+        # if env_id == 0:
+        #     num_bodies = self.gym.get_actor_rigid_body_count(env_handle, actor_handle)
+        #     body_shape_props = self.gym.get_actor_rigid_shape_properties(
+        #         env_handle, actor_handle
+        #     )
+        #     print(f"  - 长方体障碍物Actor刚体数量: {num_bodies}")
+        #     print(f"  - 长方体障碍物Actor碰撞形状数量: {len(body_shape_props)}")
+        #     if len(body_shape_props) > 0:
+        #         print(f"  - 第一个形状类型: {type(body_shape_props[0])}")
 
         # 存储actor句柄，便于后续管理
         self.static_obstacle_handles.append(actor_handle)
@@ -3091,61 +3184,6 @@ class LeggedRobot(BaseTask):
 
         return reward
 
-    def _reward_stable_crawl(self):
-        """
-        奖励稳定钻行（钻过模式）
-        检测在低姿态通过障碍物时的姿态稳定性
-        """
-        if (
-            not hasattr(self.terrain, "virtual_crossbars")
-            or len(self.terrain.virtual_crossbars) == 0
-        ):
-            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-
-        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-
-        robot_pos = self.root_states[:, :3]
-        robot_x = robot_pos[:, 0]
-        robot_y = robot_pos[:, 1]
-        robot_z = robot_pos[:, 2]
-
-        # 检测姿态稳定性：roll和pitch应该很小
-        roll = self.roll
-        pitch = self.pitch
-
-        for env_idx in range(self.num_envs):
-            env_origin = self.env_origins[env_idx]
-            rel_robot_x = robot_x[env_idx] - env_origin[0]
-            rel_robot_y = robot_y[env_idx] - env_origin[1]
-
-            for crossbar in self.terrain.virtual_crossbars:
-                crossbar_x = crossbar["x"]
-                crossbar_y = crossbar["y"]
-                crossbar_height = crossbar["height"]
-                crossbar_width = crossbar["width"]
-                crossbar_depth = crossbar["depth"]
-
-                x_in_range = abs(rel_robot_x - crossbar_x) < (crossbar_depth / 2 + 0.3)
-                y_in_range = abs(rel_robot_y - crossbar_y) < (crossbar_width / 2)
-
-                if x_in_range and y_in_range:
-                    ground_z = env_origin[2]
-                    robot_height = robot_z[env_idx] - ground_z
-
-                    # 如果在低姿态通过
-                    if robot_height < crossbar_height * 0.9:
-                        # 奖励姿态稳定（roll和pitch小）
-                        roll_penalty = torch.abs(roll[env_idx])
-                        pitch_penalty = torch.abs(pitch[env_idx])
-
-                        # 姿态越稳定，奖励越高
-                        if roll_penalty < 0.3 and pitch_penalty < 0.3:  # 约17度
-                            reward[env_idx] += (
-                                1.0 - (roll_penalty + pitch_penalty) / 0.6
-                            )
-
-        return reward
-
     def _reward_feet_air_time(self):
         """
         奖励适当的腾空时间，鼓励良好的步态
@@ -3281,111 +3319,323 @@ class LeggedRobot(BaseTask):
         # 简单地返回全1，表示所有存活的机器人都获得奖励
         return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
 
-    def _reward_strategic_height(self):
+    def _reward_excessive_leg_width(self):
         """
-        【核心创新】智能高度奖励：根据障碍物高度自主决策跳跃或钻爬
+        惩罚左右腿距离过大（Y轴方向距离超过500mm）
 
-        设计理念：
-        - 在平地区域：奖励正常站立高度（0.35m）
-        - 靠近高栏杆（>=0.35m）：奖励爬行姿态（0.25m）
-        - 靠近低栏杆（<0.35m）：不施加高度奖励，让机器人自由探索跳跃
-
-        这样设计的好处：
-        1. 在平地上机器人学会稳定行走
-        2. 面对高栏杆时学会钻爬（避免碰撞）
-        3. 面对低栏杆时自由探索跳跃（no_fly惩罚已大幅减弱）
-        4. 策略完全由奖励引导，无需人工规则
+        这个惩罚的目的是：
+        1. 防止机器人左右腿张开过大，导致与栏杆侧柱碰撞
+        2. 栏杆宽度为500mm，左右腿的跨度不应超过这个距离
+        3. 鼓励机器人保持紧凑的姿态通过栏杆
         """
-        # 1. 获取平地站立和爬行目标
-        normal_target = getattr(self.cfg.rewards, "base_height_normal", 0.35)
-        crawl_target = getattr(self.cfg.rewards, "base_height_target", 0.25)
+        # 获取所有脚的位置 [num_envs, num_feet, 3]
+        feet_pos = self.rigid_body_states[:, self.feet_indices, :3]
 
-        # 2. 获取当前基座高度
-        current_height = self.root_states[:, 2] - self.env_origins[:, 2]
+        # 初始化惩罚
+        penalty = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
-        # 3. 获取最近障碍物信息（使用特权观测）
-        # self.static_hurdle_info 存储了 (N, 4, 3) 的 [x, y, height]
+        # 宽度限制（单位：米）
+        max_width = getattr(self.cfg.rewards, "max_leg_width", 0.5)  # 500mm
+
+        # 假设脚的顺序是：[FL, FR, RL, RR] 或类似的左右对称排列
+        # 通常前两只是前腿，后两只是后腿
+        num_feet = len(self.feet_indices)
+
+        if num_feet >= 4:
+            # 对每个环境计算前腿和后腿的Y轴距离
+            for env_idx in range(self.num_envs):
+                # 前两只脚（前腿）
+                front_left_y = feet_pos[env_idx, 0, 1]
+                front_right_y = feet_pos[env_idx, 1, 1]
+                front_width = torch.abs(front_left_y - front_right_y)
+
+                # 后两只脚（后腿）
+                rear_left_y = feet_pos[env_idx, 2, 1]
+                rear_right_y = feet_pos[env_idx, 3, 1]
+                rear_width = torch.abs(rear_left_y - rear_right_y)
+
+                # 如果前腿宽度超过限制
+                if front_width > max_width:
+                    excess = front_width - max_width
+                    penalty[env_idx] += excess / max_width
+
+                # 如果后腿宽度超过限制
+                if rear_width > max_width:
+                    excess = rear_width - max_width
+                    penalty[env_idx] += excess / max_width
+
+        return penalty
+
+    def _reward_hurdle_alignment(self):
+        """
+        奖励与栏杆对准（Y轴和航向），防止斜着过栏杆
+
+        设计目的：
+        1. 栏杆宽度只有500mm，斜着过容易撞到侧柱
+        2. 奖励机器人正对栏杆（Y轴对齐 + 航向对齐）
+        3. 只在接近栏杆时生效，避免干扰平地行走
+
+        【关键修复】添加前进速度门控和距离衰减，防止"站桩刷分"
+        """
+        # 初始化奖励
+        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 如果没有障碍物信息，返回0
+        if not hasattr(self, "static_hurdle_info"):
+            return reward
+
+        # 获取机器人位置和朝向
         robot_pos_xy = self.root_states[:, :2]
+        robot_yaw = self.yaw  # 机器人航向角
+
+        # 获取障碍物信息
+        hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+
+        # 计算到所有栏杆的相对位置
+        relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]  # X距离
+        lateral_distance = relative_pos[:, :, 1]  # Y距离
+
+        # 找到最近的前方栏杆
+        forward_distance_masked = forward_distance.clone()
+        forward_distance_masked[forward_distance_masked <= 0.0] = 999.0
+
+        min_dist_to_hurdle, min_dist_indices = torch.min(forward_distance_masked, dim=1)
+
+        # 获取最近栏杆的Y轴偏差
+        nearest_lateral_distance = lateral_distance[
+            torch.arange(self.num_envs, device=self.device), min_dist_indices
+        ]
+
+        # 配置参数
+        detection_range = getattr(
+            self.cfg.rewards, "alignment_detection_range", 1.5
+        )  # 1.5m内开始检测
+        y_tolerance = getattr(
+            self.cfg.rewards, "y_alignment_tolerance", 0.15
+        )  # Y轴偏差容忍15cm
+        yaw_tolerance = getattr(
+            self.cfg.rewards, "yaw_alignment_tolerance", 0.3
+        )  # 航向偏差容忍约17度
+
+        # 只在接近栏杆时计算对准奖励
+        near_hurdle = min_dist_to_hurdle < detection_range
+
+        for env_idx in range(self.num_envs):
+            if not near_hurdle[env_idx]:
+                continue
+
+            # 1. Y轴对齐奖励（横向偏差小）
+            y_error = torch.abs(nearest_lateral_distance[env_idx])
+            if y_error < y_tolerance:
+                # 使用高斯奖励：偏差越小，奖励越高
+                y_alignment_reward = torch.exp(-y_error / y_tolerance * 3.0)
+            else:
+                # 超出容忍范围，惩罚
+                y_alignment_reward = -0.5 * (y_error - y_tolerance) / y_tolerance
+
+            # 2. 航向对齐奖励（朝向栏杆）
+            # 理想航向应该是0（正前方），偏离0越多越差
+            yaw_error = torch.abs(robot_yaw[env_idx])
+            if yaw_error < yaw_tolerance:
+                # 使用高斯奖励：偏差越小，奖励越高
+                yaw_alignment_reward = torch.exp(-yaw_error / yaw_tolerance * 3.0)
+            else:
+                # 超出容忍范围，惩罚
+                yaw_alignment_reward = (
+                    -0.5 * (yaw_error - yaw_tolerance) / yaw_tolerance
+                )
+
+            # 综合奖励：Y轴对齐 + 航向对齐
+            reward[env_idx] = (y_alignment_reward + yaw_alignment_reward) * 0.5
+
+        # 【关键修复】速度门控：只在前进时给分，防止站桩刷分
+        forward_speed = torch.clamp(self.base_lin_vel[:, 0], min=0.0)
+        speed_threshold = 0.05  # 5 cm/s 最低前进速度
+        speed_gate = torch.clamp(forward_speed / speed_threshold, 0.0, 1.0)
+        reward = reward * speed_gate
+
+        # 距离衰减因子：越靠近障碍物，对准要求越高
+        # 在1.5m外不给奖励，越近奖励权重越大
+        distance_factor = torch.where(
+            min_dist_to_hurdle < detection_range,
+            1.0 - torch.clamp(min_dist_to_hurdle / detection_range, 0.0, 1.0),
+            torch.zeros_like(min_dist_to_hurdle),
+        )
+        reward = reward * distance_factor
+
+        return reward
+
+    def _reward_height_based_guidance(self):
+        """
+        基于下一个障碍物高度的引导奖励（稀疏正奖励）
+
+        根据机器人即将面对的障碍物高度，给予不同的引导：
+        - 200-350mm的栏杆：奖励跳跃行为（身体抬高）或爬行姿态
+        - 350-500mm的栏杆：奖励钻爬行为（身体降低）
+
+        这是一个稀疏奖励，只在接近障碍物并采取正确策略时给予正奖励
+
+        【关键修复】添加前进速度门控，防止"站桩刷分"
+        """
+        # 获取机器人当前位置和高度
+        robot_pos_xy = self.root_states[:, :2]
+        robot_height = self.root_states[:, 2] - self.env_origins[:, 2]
+
+        # 初始化奖励
+        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 如果没有障碍物信息，返回0
+        if not hasattr(self, "static_hurdle_info"):
+            return reward
+
+        # 获取障碍物信息 (N, 4, 3) [x, y, height]
         hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
         hurdle_heights = self.static_hurdle_info[:, :, 2]  # (N, 4)
 
         # 计算机器人到所有栏杆的X轴（前向）距离
-        # (N, 1, 2) - (N, 4, 2) -> (N, 4, 2)
         relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
         forward_distance = relative_pos[:, :, 0]  # (N, 4)
 
         # 找到即将面对的障碍物（X距离为正且最小）
-        forward_distance = forward_distance.clone()
-        forward_distance[forward_distance <= 0.0] = 999.0  # 忽略已通过的
+        forward_distance_masked = forward_distance.clone()
+        forward_distance_masked[forward_distance_masked <= 0.0] = 999.0  # 忽略已通过的
 
-        # (N,)
-        min_dist_to_hurdle, min_dist_indices = torch.min(forward_distance, dim=1)
+        min_dist_to_hurdle, min_dist_indices = torch.min(forward_distance_masked, dim=1)
 
-        # (N,)
+        # 获取最近障碍物的高度
         nearest_hurdle_height = hurdle_heights[
             torch.arange(self.num_envs, device=self.device), min_dist_indices
         ]
 
-        # 4. 定义奖励逻辑
+        # 配置参数
+        detection_range = getattr(
+            self.cfg.rewards, "guidance_detection_range", 1.5
+        )  # 在该范围内开始引导
+        low_hurdle_max = getattr(
+            self.cfg.rewards, "low_hurdle_threshold", 0.35
+        )  # 35cm以下为低栏
+        high_hurdle_min = getattr(
+            self.cfg.rewards, "high_hurdle_threshold", 0.35
+        )  # 35cm及以上为高栏
 
-        # 4.1. 奖励平地站立 (高斯奖励)
+        # 跳跃/爬行的目标高度
+        jump_target_height = getattr(
+            self.cfg.rewards, "jump_height_target", 0.40
+        )  # 跳跃时身体应抬高
+        crawl_target_height = getattr(
+            self.cfg.rewards, "base_height_target", 0.25
+        )  # 钻爬时身体应降低
+
+        # 更宽容的高度误差容忍度（可配置）
+        low_tol = getattr(self.cfg.rewards, "low_guidance_tolerance", 0.20)
+        high_tol = getattr(self.cfg.rewards, "high_guidance_tolerance", 0.15)
+
+        # 只对接近障碍物的机器人给予引导
+        near_obstacle = min_dist_to_hurdle < detection_range
+
+        for env_idx in range(self.num_envs):
+            if not near_obstacle[env_idx]:
+                continue
+
+            hurdle_h = nearest_hurdle_height[env_idx]
+            robot_h = robot_height[env_idx]
+            dist = min_dist_to_hurdle[env_idx]
+
+            # 单一距离权重：越接近障碍物，奖励越强（线性0~1）
+            distance_weight = torch.clamp(1.0 - dist / detection_range, 0.0, 1.0)
+
+            # 低栏：鼓励接近跳跃目标高度（高斯成形，始终提供平滑正奖励）
+            if hurdle_h < low_hurdle_max:
+                height_error = torch.abs(robot_h - jump_target_height)
+                shaped = torch.exp(-torch.square(height_error / low_tol))
+                reward[env_idx] = shaped * distance_weight
+
+            # 高栏：鼓励接近爬行目标高度（高斯成形，始终提供平滑正奖励）
+            else:  # hurdle_h >= high_hurdle_min
+                height_error = torch.abs(robot_h - crawl_target_height)
+                shaped = torch.exp(-torch.square(height_error / high_tol))
+                reward[env_idx] = shaped * distance_weight
+
+        # 速度门控：只在前进时给分，防止站桩刷分（保持温和阈值）
+        forward_speed = torch.clamp(self.base_lin_vel[:, 0], min=0.0)
+        speed_threshold = 0.05  # 5 cm/s 最低前进速度
+        speed_gate = torch.clamp(forward_speed / speed_threshold, 0.0, 1.0)
+        reward = reward * speed_gate
+
+        return reward
+
+    def _reward_strategic_height(self):
+        """根据障碍物高度引导机器人选择策略：平地站立/高栏钻爬/低栏自由探索"""
+        # 获取目标高度
+        normal_target = getattr(self.cfg.rewards, "base_height_normal", 0.35)
+        crawl_target = getattr(self.cfg.rewards, "base_height_target", 0.25)
+        current_height = self.root_states[:, 2] - self.env_origins[:, 2]
+
+        # 找到最近的前方栏杆
+        robot_pos_xy = self.root_states[:, :2]
+        hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+
+        relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0].clone()
+        forward_distance[forward_distance <= 0.0] = 999.0
+
+        min_dist_to_hurdle, min_dist_indices = torch.min(forward_distance, dim=1)
+        nearest_hurdle_height = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_dist_indices
+        ]
+
+        # 计算高斯奖励
         reward_normal = torch.exp(-torch.abs(current_height - normal_target) * 15.0)
-
-        # 4.2. 奖励钻爬 (高斯奖励)
         reward_crawl = torch.exp(-torch.abs(current_height - crawl_target) * 20.0)
 
-        # 5. 定义策略阈值
-        detection_range = 1.5  # 栏杆前方 1.5m 开始决策
-        jump_threshold = 0.35  # 低于 0.35m 的栏杆，机器人应该跳
+        # 根据情况分配奖励（三选一，互斥）
+        detection_range = 1.5
+        jump_threshold = 0.35
 
-        # 6. 根据情况应用不同奖励
-
-        # 6.1. 在平地区域 (远离栏杆)
         is_on_flat = min_dist_to_hurdle > detection_range
-
-        # 6.2. 靠近高栏杆 (必须钻爬)
         is_near_high_hurdle = (min_dist_to_hurdle <= detection_range) & (
             nearest_hurdle_height >= jump_threshold
         )
 
-        # 6.3. 靠近低栏杆 (必须跳跃)
-        is_near_low_hurdle = (min_dist_to_hurdle <= detection_range) & (
-            nearest_hurdle_height < jump_threshold
-        )
-
-        # 组合奖励：
-        # 在平地，使用 normal 奖励
-        # 靠近高栏杆，使用 crawl 奖励
-        # 靠近低栏杆，奖励 0 (让它自由探索，此时'no_fly'惩罚很低，它会去尝试跳跃)
+        # 条件赋值（不是求和！）：平地→站立奖励，高栏→爬行奖励，低栏→0（自由探索）
         reward = torch.zeros_like(current_height)
         reward[is_on_flat] = reward_normal[is_on_flat]
         reward[is_near_high_hurdle] = reward_crawl[is_near_high_hurdle]
-        # is_near_low_hurdle 保持为 0
 
         return reward
 
     def _reward_no_fly(self):
-        """
-        只惩罚持续的正向Z速度（向上飞），允许短暂跳跃
-
-        设计理念：
-        - 旧版本惩罚所有Z轴速度，导致机器人不敢跳跃
-        - 新版本只惩罚较大的正向Z速度（向上飞），对负向速度（落地）和小幅度跳跃容忍
-        - 这样既防止了过度的"飞行"抖动，又允许必要的跳跃动作
-        """
+        """惩罚过大的向上速度（>1.5m/s），允许跳跃"""
         z_vel = self.base_lin_vel[:, 2]
+        excess_upward_vel = torch.clamp(z_vel - 1.5, min=0.0)
+        return torch.square(excess_upward_vel)
 
-        # 只对正向速度（向上）施加惩罚，且使用阈值
-        # 阈值设为0.5 m/s：小于此速度视为正常，不惩罚
-        threshold = 0.5
+    def _reward_termination(self):
+        """
+        终止惩罚：当环境因任何原因触发重置时给予惩罚
 
-        # 计算超出阈值的正向速度
-        excess_upward_vel = torch.clamp(z_vel - threshold, min=0.0)
+        这包括：
+        - 摔倒（roll/pitch 超限）
+        - 基座触地
+        - 高度过低
+        - 卡住检测触发
+        - 达到最大episode长度
 
-        # 使用平方惩罚，只惩罚过大的向上速度
-        penalty = torch.square(excess_upward_vel)
+        返回：
+            torch.Tensor: 每个环境的终止惩罚值（触发终止时为1.0，否则为0.0）
+        """
+        # reset_buf 中为 True 的环境表示需要重置（即触发了终止条件）
+        # 但不惩罚因为完成任务（达到所有目标点）而终止的情况
+        termination = self.reset_buf.clone().float()
 
-        return penalty
+        # 如果是因为达到目标而终止（time_out_buf 且 cur_goal_idx >= num_goals），不惩罚
+        # 这是正常完成任务，应该给予奖励而不是惩罚
+        reached_all_goals = self.cur_goal_idx >= self.cfg.terrain.num_goals
+        termination[reached_all_goals] = 0.0
+
+        return termination
 
     # ========================================================================
     # 课程学习管理器 (Curriculum Learning Manager)
@@ -3460,13 +3710,13 @@ class LeggedRobot(BaseTask):
         # 应用第一阶段配置
         self._apply_curriculum_stage(0)
 
-        print(f"[课程学习] 已启用，共{len(self.curriculum_stages)}个阶段")
-        print(f"[课程学习] 当前阶段: 阶段1 - {self.curriculum_stages[0]['name']}")
+        # print(f"[课程学习] 已启用，共{len(self.curriculum_stages)}个阶段")
+        # print(f"[课程学习] 当前阶段: 阶段1 - {self.curriculum_stages[0]['name']}")
 
     def _apply_curriculum_stage(self, stage_idx):
         """应用指定阶段的课程配置"""
         if stage_idx >= len(self.curriculum_stages):
-            print(f"[课程学习] 已完成所有阶段！")
+            # print(f"[课程学习] 已完成所有阶段！")
             return
 
         stage = self.curriculum_stages[stage_idx]
@@ -3476,15 +3726,15 @@ class LeggedRobot(BaseTask):
         # 更新速度指令范围
         self.command_ranges["lin_vel_x"] = stage["vel_range"]
 
-        print(f"\n{'='*80}")
-        print(f"[课程学习] 切换到阶段{stage_idx + 1}: {stage['name']}")
-        print(f"  - 地形类型: {stage['terrain_types']}")
-        print(f"  - 障碍物高度: {stage['obstacle_heights']}")
-        print(f"  - 障碍物数量: {stage['num_obstacles']}")
-        print(f"  - 速度范围: {stage['vel_range']} m/s")
-        print(f"  - 成功率阈值: {stage['success_threshold']}")
-        print(f"  - 最少训练迭代: {stage['min_iterations']}")
-        print(f"{'='*80}\n")
+        # print(f"\n{'='*80}")
+        # print(f"[课程学习] 切换到阶段{stage_idx + 1}: {stage['name']}")
+        # print(f"  - 地形类型: {stage['terrain_types']}")
+        # print(f"  - 障碍物高度: {stage['obstacle_heights']}")
+        # print(f"  - 障碍物数量: {stage['num_obstacles']}")
+        # print(f"  - 速度范围: {stage['vel_range']} m/s")
+        # print(f"  - 成功率阈值: {stage['success_threshold']}")
+        # print(f"  - 最少训练迭代: {stage['min_iterations']}")
+        # print(f"{'='*80}\n")
 
     def _update_curriculum_stage(self):
         """
@@ -3524,11 +3774,12 @@ class LeggedRobot(BaseTask):
 
                 if avg_success >= stage["success_threshold"]:
                     # 进入下一阶段
-                    print(f"\n[课程学习] 阶段{self.curriculum_stage + 1}完成！")
-                    print(f"  - 训练迭代: {self.curriculum_iteration}")
-                    print(
-                        f"  - 平均成功率: {avg_success:.2%} (阈值: {stage['success_threshold']:.2%})"
-                    )
+                    # print(f"\n[课程学习] 阶段{self.curriculum_stage + 1}完成！")
+                    # print(f"  - 训练迭代: {self.curriculum_iteration}")
+                    # print(
+                    #     f"  - 平均成功率: {avg_success:.2%} (阈值: {stage['success_threshold']:.2%})"
+                    # )
+                    pass
 
                     # 切换到下一阶段
                     self.curriculum_success_buffer.clear()
@@ -3537,7 +3788,7 @@ class LeggedRobot(BaseTask):
                     # 重新生成地形（如果需要）
                     # 注意：这里需要重新创建地形，但Isaac Gym不支持动态地形更改
                     # 实际应用中，可以通过预先生成多个地形类型，然后在reset时选择合适的地形
-                    print(f"[课程学习] 提示：地形配置已更新，重新训练时将使用新地形")
+                    # print(f"[课程学习] 提示：地形配置已更新，重新训练时将使用新地形")
 
     def get_curriculum_stage_info(self):
         """获取当前课程学习阶段信息（用于日志记录）"""
