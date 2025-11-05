@@ -148,7 +148,7 @@ class Terrain:
             choice = np.random.uniform(0, 1)
             # difficulty = np.random.choice([0.5, 0.75, 0.9])
             difficulty = np.random.uniform(-0.2, 1.2)
-            terrain = self.make_terrain(choice, difficulty)
+            terrain = self.make_terrain(choice, difficulty, row=i, col=j)
             self.add_terrain_to_map(terrain, i, j)
 
     def curiculum(self, random=False, max_difficulty=False):
@@ -160,11 +160,15 @@ class Terrain:
                 choice = j / self.cfg.num_cols + 0.001
                 if random:
                     if max_difficulty:
-                        terrain = self.make_terrain(choice, np.random.uniform(0.7, 1))
+                        terrain = self.make_terrain(
+                            choice, np.random.uniform(0.7, 1), row=i, col=j
+                        )
                     else:
-                        terrain = self.make_terrain(choice, np.random.uniform(0, 1))
+                        terrain = self.make_terrain(
+                            choice, np.random.uniform(0, 1), row=i, col=j
+                        )
                 else:
-                    terrain = self.make_terrain(choice, difficulty)
+                    terrain = self.make_terrain(choice, difficulty, row=i, col=j)
 
                 self.add_terrain_to_map(terrain, i, j)
 
@@ -198,7 +202,7 @@ class Terrain:
             downsampled_scale=self.cfg.downsampled_scale,
         )
 
-    def make_terrain(self, choice, difficulty):
+    def make_terrain(self, choice, difficulty, row=None, col=None):
         terrain = terrain_utils.SubTerrain(
             "terrain",
             width=self.length_per_env_pixels,
@@ -206,63 +210,149 @@ class Terrain:
             vertical_scale=self.cfg.vertical_scale,
             horizontal_scale=self.cfg.horizontal_scale,
         )
-        slope = difficulty * 0.4
-        step_height = 0.02 + 0.14 * difficulty
-        discrete_obstacles_height = 0.03 + difficulty * 0.15
-        stepping_stones_size = 1.5 * (1.05 - difficulty)
-        stone_distance = 0.05 if difficulty == 0 else 0.1
-        gap_size = 1.0 * difficulty
-        pit_depth = 1.0 * difficulty
-
         num_hurdles = 4
-        if difficulty < 0.25:
-            # 阶段1：平地行走 (difficulty: 0.0 - 0.25)
-            # 使用极低高度（5cm-8cm可通过高度），让机器人学习基本行走
-            height_range = [0.05, 0.08]
-        elif difficulty < 0.5:
-            # 阶段2：学习跳跃/攀爬 (difficulty: 0.25 - 0.5)
-            # 生成低中栏杆（20-35cm可通过高度），鼓励机器人跳跃或爬过
-            height_range = [0.20, 0.35]
-        elif difficulty < 0.75:
-            # 阶段3：学习钻爬 (difficulty: 0.5 - 0.75)
-            # 生成高栏杆（35-50cm可通过高度），机器人必须钻过
-            height_range = [0.35, 0.50]
-        else:
-            # 阶段4：混合策略 (difficulty: 0.75 - 1.0)
-            # 生成所有高度的栏杆（20-50cm可通过高度），机器人需要自主选择策略
-            height_range = [0.20, 0.50]
+        height_range = [0.20, 0.50]
+        x_spacing = [2.0, 2.5]
+        y_spacing = [0.0, 0.0]
+        post_spacing = 0.5
+        use_progressive = True
+        progressive_sequence_override = None
+
+        schedule = getattr(self.cfg, "curriculum_schedule", None)
+        if schedule is not None and row is not None:
+            level_idx = int(np.clip(row, 0, len(schedule) - 1))
+            level_cfg = schedule[level_idx]
+
+            jump_cols = set(getattr(self.cfg, "jump_columns", [0, 1]))
+            crawl_cols = set(getattr(self.cfg, "crawl_columns", [2, 3]))
+            strategy_key = "default"
+            if col is not None:
+                if col in jump_cols:
+                    strategy_key = "jump"
+                elif col in crawl_cols:
+                    strategy_key = "crawl"
+
+            strategy_cfg = None
+            if isinstance(level_cfg, dict):
+                strategy_cfg = level_cfg.get(strategy_key) or level_cfg.get("default")
+
+            if strategy_cfg:
+                seq = strategy_cfg.get("sequence")
+                if seq:
+                    progressive_sequence_override = list(seq)
+                    num_hurdles = len(progressive_sequence_override)
+                    if num_hurdles == 0:
+                        progressive_sequence_override = [height_range[0]]
+                        num_hurdles = 1
+                    height_range = [
+                        min(progressive_sequence_override),
+                        max(progressive_sequence_override),
+                    ]
+                    use_progressive = True
+                else:
+                    height_range = strategy_cfg.get("height_range", height_range)
+                    use_progressive = strategy_cfg.get("progressive", use_progressive)
+
+                x_spacing = strategy_cfg.get("x_spacing", x_spacing)
+                y_spacing = strategy_cfg.get("y_range", y_spacing)
+                post_spacing = strategy_cfg.get("post_spacing", post_spacing)
+                num_hurdles = max(1, strategy_cfg.get("num_hurdles", num_hurdles))
 
         # H型栏杆地形 - 唯一的地形类型
         if choice < self.proportions[0]:
             idx = 0
             # H型栏杆：两根立柱 + 悬空横梁
-            h_hurdle_terrain(
-                terrain,
-                num_hurdles=num_hurdles,  # 根据课程学习阶段动态决定
-                total_goals=self.num_goals,  # 确保目标点数组大小一致
-                x_range=[2.0, 2.5],  # 栏杆间距（米）
-                y_range=[0.0, 0.0],  # 完全居中
-                height_range=height_range,  # 根据课程学习阶段动态决定
-                pad_height=0,
-                progressive_heights=False,  # 禁用递进高度，改用动态height_range
-                post_spacing=0.5,  # 两根立柱之间的间距（内侧距离）50cm
-                crossbar_inset=0.05,  # 横梁向内缩进5cm
-            )
-            self.add_roughness(terrain)
-        else:
-            # 备用：如果出现意外，默认也使用h_hurdle
-            idx = 0
+            # 优化：支持play.py中的固定高度演示配置
+            demo_heights = getattr(self.cfg, "demo_heights", None)
+            demo_progressive_cols = getattr(self.cfg, "demo_progressive_cols", [])
+
+            # 确定当前列的高度配置
+            if demo_heights is not None and col is not None and col < len(demo_heights):
+                demo_height = demo_heights[col]
+                if demo_height is not None:
+                    # 固定高度列
+                    use_height_range = [demo_height, demo_height]
+                    use_progressive = False
+                elif col in demo_progressive_cols:
+                    # 递进混合列：200-300-400-500mm
+                    use_height_range = [0.20, 0.50]
+                    use_progressive = True
+                else:
+                    # 回退到默认课程模式
+                    use_height_range = height_range
+                    use_progressive = False
+            else:
+                # 兼容旧版：使用原有的override逻辑
+                override_height = getattr(self.cfg, "demo_passable_height", None)
+                override_progressive = getattr(self.cfg, "demo_progressive", None)
+                use_height_range = (
+                    [override_height, override_height]
+                    if override_height is not None
+                    else height_range
+                )
+                use_progressive = (
+                    bool(override_progressive)
+                    if override_progressive is not None
+                    else False
+                )
+
             h_hurdle_terrain(
                 terrain,
                 num_hurdles=num_hurdles,
                 total_goals=self.num_goals,
-                x_range=[2.0, 2.5],
-                y_range=[0.0, 0.0],
-                height_range=height_range,
+                x_range=x_spacing,
+                y_range=y_spacing,
+                height_range=use_height_range,
                 pad_height=0,
-                progressive_heights=False,
-                post_spacing=0.5,  # 两根立柱之间的间距（内侧距离）50cm
-                crossbar_inset=0.05,  # 横梁向内缩进5cm
+                progressive_heights=use_progressive,
+                post_spacing=post_spacing,
+                crossbar_inset=0.05,
+                progressive_sequence=progressive_sequence_override,
+            )
+            self.add_roughness(terrain)
+        else:
+            # 备用：如果出现意外，默认也使用h_hurdle（与上面逻辑一致）
+            idx = 0
+            demo_heights = getattr(self.cfg, "demo_heights", None)
+            demo_progressive_cols = getattr(self.cfg, "demo_progressive_cols", [])
+
+            if demo_heights is not None and col is not None and col < len(demo_heights):
+                demo_height = demo_heights[col]
+                if demo_height is not None:
+                    use_height_range = [demo_height, demo_height]
+                    use_progressive = False
+                elif col in demo_progressive_cols:
+                    use_height_range = [0.20, 0.50]
+                    use_progressive = True
+                else:
+                    use_height_range = height_range
+                    use_progressive = False
+            else:
+                override_height = getattr(self.cfg, "demo_passable_height", None)
+                override_progressive = getattr(self.cfg, "demo_progressive", None)
+                use_height_range = (
+                    [override_height, override_height]
+                    if override_height is not None
+                    else height_range
+                )
+                use_progressive = (
+                    bool(override_progressive)
+                    if override_progressive is not None
+                    else False
+                )
+
+            h_hurdle_terrain(
+                terrain,
+                num_hurdles=num_hurdles,
+                total_goals=self.num_goals,
+                x_range=x_spacing,
+                y_range=y_spacing,
+                height_range=use_height_range,
+                pad_height=0,
+                progressive_heights=use_progressive,
+                post_spacing=post_spacing,
+                crossbar_inset=0.05,
+                progressive_sequence=progressive_sequence_override,
             )
             self.add_roughness(terrain)
         # np.set_printoptions(precision=2)
@@ -839,6 +929,7 @@ def h_hurdle_terrain(
     pad_width=0.1,
     pad_height=0.5,
     progressive_heights=True,
+    progressive_sequence=None,
     post_spacing=0.5,  # 两根立柱内侧距离（宽度）
     crossbar_inset=0.0,
 ):
@@ -878,8 +969,10 @@ def h_hurdle_terrain(
 
     # 可用的栏杆高度（标准高度）
     available_heights = [0.2, 0.3, 0.4, 0.5]
-    if progressive_heights:
-        progressive_sequence = [0.2, 0.3, 0.4, 0.5]  # 递进高度序列
+    if progressive_sequence is not None:
+        progressive_sequence = list(progressive_sequence)
+    elif progressive_heights:
+        progressive_sequence = available_heights[: max(1, num_hurdles)]
     else:
         progressive_sequence = None
 
@@ -892,7 +985,7 @@ def h_hurdle_terrain(
     # post_distance = 0.5  # 旧版：硬编码，导致与横梁长度不一致
 
     crossbar_radius = 0.005  # 横梁半径 [米]
-    crossbar_length = post_spacing  # 横梁长度（与立柱间距一致）
+    crossbar_length = 0.7  # 横梁长度（与立柱间距一致）
 
     for i in range(num_hurdles):
         # 计算下一个栏杆的X坐标位置
@@ -907,9 +1000,9 @@ def h_hurdle_terrain(
         rand_y = np.random.randint(dis_y_min, dis_y_max) if dis_y_max > dis_y_min else 0
 
         # 选择当前栏杆的可通过高度（上横杆下端到下横杆上端的距离）
-        if progressive_heights and i < len(progressive_sequence):
-            # 使用递进高度序列（旧版逻辑）
-            passable_height = progressive_sequence[i]
+        if progressive_sequence is not None and len(progressive_sequence) > 0:
+            seq_idx = min(i, len(progressive_sequence) - 1)
+            passable_height = progressive_sequence[seq_idx]
         else:
             # 【优化】直接在传入的 height_range [min, max] 之间随机取值
             # 这确保了无论 height_range 是什么，都能得到一个有效的高度
@@ -931,7 +1024,7 @@ def h_hurdle_terrain(
         bottom_bar_offset_x = 0.0  # 底部横杆在X轴前移0cm（避免与立柱连接成墙）
         bottom_bar_radius = 0.005  # 底部横杆半径（0.5cm）
         # 【修复】底部横杆长度应该与立柱间距一致
-        bottom_bar_length = post_spacing
+        bottom_bar_length = post_spacing * 0.5
 
         # 【关键修正】根据可通过高度计算顶部横杆和立柱高度
         # 定义：可通过高度 = 上横杆下端 - 下横杆上端

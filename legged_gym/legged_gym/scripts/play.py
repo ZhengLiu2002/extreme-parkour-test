@@ -68,11 +68,12 @@ def play(args):
     # override some parameters for testing
     if args.nodelay:
         env_cfg.domain_rand.action_delay_view = 0
-    env_cfg.env.num_envs = 3 if not args.save else 64
+    # 优化：设置5列固定地形，分别展示200/300/400/500/混合栏杆
+    env_cfg.env.num_envs = 5 if not args.save else 64
     env_cfg.env.episode_length_s = 60
     env_cfg.commands.resampling_time = 60
     env_cfg.terrain.num_rows = 1
-    env_cfg.terrain.num_cols = 3
+    env_cfg.terrain.num_cols = 5  # 5列：200mm, 300mm, 400mm, 500mm, 混合
     env_cfg.terrain.height = [0.02, 0.02]
     env_cfg.terrain.terrain_dict = {
         "smooth slope": 0.0,
@@ -101,6 +102,15 @@ def play(args):
     env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.max_difficulty = True
+
+    # 优化：为5列设置固定的栏杆高度
+    # 列0: 200mm固定高度
+    # 列1: 300mm固定高度
+    # 列2: 400mm固定高度
+    # 列3: 500mm固定高度
+    # 列4: 200-300-400-500mm递进混合
+    env_cfg.terrain.demo_heights = [0.05, 0.3, 0.4, 0.6, None]  # None表示混合模式
+    env_cfg.terrain.demo_progressive_cols = [4]  # 第4列使用递进模式
 
     env_cfg.depth.angle = [0, 1]
     env_cfg.noise.add_noise = True

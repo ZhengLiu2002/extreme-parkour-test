@@ -31,8 +31,10 @@
 from legged_gym import LEGGED_GYM_ROOT_DIR, envs
 from time import time
 from warnings import WarningMessage
+from collections import deque
 import numpy as np
 import os
+import copy
 
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
@@ -940,6 +942,98 @@ class LeggedRobot(BaseTask):
             raise NameError(f"Unknown controller type: {control_type}")
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
+    def update_command_curriculum(self, env_ids):
+        """渐进式扩大命令范围，提升任务难度。
+
+        策略：以最近若干次 episode 的目标点完成度作为进度指标，
+        只有在确实穿越足够多障碍后才放宽最大前向速度，避免"原地刷时间"。
+        """
+
+        if not self.cfg.commands.curriculum:
+            return
+
+        if self.command_curriculum_buffer is None:
+            self.command_curriculum_buffer = deque(maxlen=20)
+
+        if len(env_ids) == 0:
+            return
+
+        num_goals = max(getattr(self.cfg.terrain, "num_goals", 1), 1)
+        goal_completion = self.cur_goal_idx[env_ids].float() / num_goals
+        goal_completion = torch.clamp(goal_completion, 0.0, 1.0)
+
+        goal_threshold = getattr(
+            self.cfg.commands, "curriculum_goal_threshold", 0.4
+        )
+
+        # 记录平均目标完成度（而非纯粹靠存活时间）
+        if goal_completion.numel() > 0:
+            self.command_curriculum_buffer.append(goal_completion.mean().item())
+        else:
+            self.command_curriculum_buffer.append(0.0)
+
+        if len(self.command_curriculum_buffer) < self.command_curriculum_buffer.maxlen:
+            return
+
+        avg_completion = sum(self.command_curriculum_buffer) / len(
+            self.command_curriculum_buffer
+        )
+
+        if avg_completion < goal_threshold:
+            return
+
+        if self._increase_command_velocity_range():
+            self.command_curriculum_buffer.clear()
+
+    def _increase_command_velocity_range(self):
+        """提升前向命令上限，返回是否实际发生更新。"""
+
+        if "lin_vel_x" not in self.command_ranges:
+            return False
+
+        current_range = self.command_ranges["lin_vel_x"]
+        max_range = self.command_max_ranges.get("lin_vel_x", current_range)
+
+        if isinstance(current_range, torch.Tensor):
+            current_max = current_range[1].item()
+        else:
+            current_max = float(current_range[1])
+
+        max_allowed = float(max_range[1]) if isinstance(max_range, (list, tuple)) else float(max_range)
+
+        if current_max >= max_allowed - 1e-6:
+            # 已经达到上限
+            return False
+
+        increment = 0.05
+        if self.command_curriculum_increments:
+            incr_val = self.command_curriculum_increments.get("lin_vel_x", increment)
+            if isinstance(incr_val, (list, tuple)):
+                increment = float(incr_val[1]) if len(incr_val) > 1 else float(incr_val[0])
+            else:
+                increment = float(incr_val)
+
+        new_max = min(current_max + increment, max_allowed)
+
+        if isinstance(current_range, torch.Tensor):
+            current_range[1] = new_max
+        else:
+            self.command_ranges["lin_vel_x"][1] = new_max
+
+        # 更新 clipping 阈值，确保不把新的小命令裁零
+        clip_margin = getattr(self.cfg.commands, "lin_vel_clip", 0.0)
+        if clip_margin >= new_max:
+            new_clip = max(new_max * 0.5, 0.01)
+            setattr(self.cfg.commands, "lin_vel_clip", new_clip)
+
+        self.command_curriculum_step += 1
+
+        self.extras.setdefault("curriculum", {})
+        self.extras["curriculum"]["lin_vel_x_max"] = new_max
+        self.extras["curriculum"]["lin_vel_x_step"] = self.command_curriculum_step
+
+        return True
+
     def _reset_dofs(self, env_ids):
         """Resets DOF position and velocities of selected environmments
         Positions are randomly selected within 0.5:1.5 x default positions.
@@ -1068,7 +1162,7 @@ class LeggedRobot(BaseTask):
             )
 
     def _update_terrain_curriculum(self, env_ids):
-        """Implements the game-inspired curriculum.
+        """Implements the game-inspired curriculum with task switching.
 
         Args:
             env_ids (List[int]): ids of environments being reset
@@ -1087,18 +1181,93 @@ class LeggedRobot(BaseTask):
             self.cur_goal_idx[env_ids].float() / self.cfg.terrain.num_goals
         )
 
-        # 通过50%以上的目标点 -> 提升难度
-        move_up = goal_completion_rate > 0.5
-        # 通过不到20%的目标点 -> 降低难度
-        move_down = goal_completion_rate < 0.2
+        # 【关键修复】收紧课程升级条件，防止"绕过栏杆"就升级
+        # 原来的问题：level 0-2只需完成1/8 (12.5%)就升级，机器人可以绕过
+        # 新策略：所有级别都需要完成至少50%的目标点，确保真正学会穿越
+        current_level = self.terrain_levels[env_ids]
+
+        # 统一升级门槛：必须完成至少50%的目标点（4/8个栏杆）
+        move_up_threshold = 0.5  # 从动态阈值改为固定50%
+
+        # 降级门槛：完成少于25%的目标点（2/8个栏杆）
+        move_down_threshold = 0.25  # 从动态阈值改为固定25%
+
+        # 通过 (阈值) 目标点 -> 提升难度
+        move_up = goal_completion_rate > move_up_threshold
+        # 通过不到 (阈值) 目标点 -> 降低难度
+        move_down = goal_completion_rate < move_down_threshold
 
         self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
-        # # Robots that solve the last level are sent to a random one
-        self.terrain_levels[env_ids] = torch.where(
-            self.terrain_levels[env_ids] >= self.max_terrain_level,
-            torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
-            torch.clip(self.terrain_levels[env_ids], 0),
-        )  # (the minumum level is zero)
+
+        # ========== 【核心优化】任务切换逻辑 ==========
+        # 当机器人完成最高难度 (level 7) 后，在跳跃和钻爬课程之间切换
+        # 这样可以在单一策略网络中训练两种通过方式
+        #
+        # 切换规则：
+        # - 完成跳跃课程 (cols 0,1) 的 level 7 -> 切换到钻爬课程 (col 2)
+        # - 完成钻爬课程 (cols 2,3) 的 level 7 -> 切换到跳跃课程 (col 0)
+        # ================================================
+
+        # 找到达到最高难度的环境
+        reached_max = self.terrain_levels[env_ids] >= self.max_terrain_level
+
+        if reached_max.any():
+            # 获取达到最高难度的环境索引
+            max_level_env_ids = env_ids[reached_max]
+
+            # 获取这些环境当前的地形类型 (col)
+            current_types = self.terrain_types[max_level_env_ids]
+
+            # 判断是跳跃课程还是钻爬课程
+            is_jump_curriculum = (current_types == 0) | (
+                current_types == 1
+            )  # cols 0 or 1
+            is_crawl_curriculum = (current_types == 2) | (
+                current_types == 3
+            )  # cols 2 or 3
+
+            # 跳跃课程 -> 钻爬课程 (切换到 col 2)
+            self.terrain_types[max_level_env_ids] = torch.where(
+                is_jump_curriculum,
+                torch.tensor(
+                    2, dtype=torch.long, device=self.device
+                ),  # 切换到钻爬课程的第一列 (col 2)
+                self.terrain_types[max_level_env_ids],
+            )
+
+            # 钻爬课程 -> 跳跃课程 (切换到 col 0)
+            self.terrain_types[max_level_env_ids] = torch.where(
+                is_crawl_curriculum,
+                torch.tensor(
+                    0, dtype=torch.long, device=self.device
+                ),  # 切换到跳跃课程的第一列 (col 0)
+                self.terrain_types[max_level_env_ids],
+            )
+
+            # 重置难度等级为 0（从新课程的最简单难度开始）
+            self.terrain_levels[max_level_env_ids] = 0
+
+            # 打印切换信息（用于调试，可选）
+            if (
+                hasattr(self, "print_curriculum_switch")
+                and self.print_curriculum_switch
+            ):
+                num_jump_to_crawl = is_jump_curriculum.sum().item()
+                num_crawl_to_jump = is_crawl_curriculum.sum().item()
+                if num_jump_to_crawl > 0:
+                    print(
+                        f"[Curriculum] {num_jump_to_crawl} 个环境从跳跃课程切换到钻爬课程"
+                    )
+                if num_crawl_to_jump > 0:
+                    print(
+                        f"[Curriculum] {num_crawl_to_jump} 个环境从钻爬课程切换到跳跃课程"
+                    )
+
+        # 确保所有难度等级都在有效范围内
+        self.terrain_levels[env_ids] = torch.clip(
+            self.terrain_levels[env_ids], 0, self.max_terrain_level - 1
+        )
+
         self.env_origins[env_ids] = self.terrain_origins[
             self.terrain_levels[env_ids], self.terrain_types[env_ids]
         ]
@@ -2320,10 +2489,22 @@ class LeggedRobot(BaseTask):
         reward_norm_factor = 1  # np.sum(list(self.reward_scales.values()))
         for rew in self.reward_scales:
             self.reward_scales[rew] = self.reward_scales[rew] / reward_norm_factor
+        max_command_ranges = class_to_dict(self.cfg.commands.max_ranges)
+        self.command_max_ranges = copy.deepcopy(max_command_ranges)
         if self.cfg.commands.curriculum:
             self.command_ranges = class_to_dict(self.cfg.commands.ranges)
+            self.command_curriculum_increments = (
+                class_to_dict(self.cfg.commands.crclm_incremnt)
+                if hasattr(self.cfg.commands, "crclm_incremnt")
+                else {}
+            )
+            self.command_curriculum_buffer = deque(maxlen=20)
+            self.command_curriculum_step = 0
         else:
-            self.command_ranges = class_to_dict(self.cfg.commands.max_ranges)
+            self.command_ranges = copy.deepcopy(max_command_ranges)
+            self.command_curriculum_increments = {}
+            self.command_curriculum_buffer = None
+            self.command_curriculum_step = 0
         if self.cfg.terrain.mesh_type not in ["heightfield", "trimesh"]:
             self.cfg.terrain.curriculum = False
         self.max_episode_length_s = self.cfg.env.episode_length_s
@@ -2621,9 +2802,56 @@ class LeggedRobot(BaseTask):
         norm = torch.norm(self.target_pos_rel, dim=-1, keepdim=True)
         target_vec_norm = self.target_pos_rel / (norm + 1e-5)
         cur_vel = self.root_states[:, 7:9]
-        rew = torch.minimum(
-            torch.sum(target_vec_norm * cur_vel, dim=-1), self.commands[:, 0]
-        ) / (self.commands[:, 0] + 1e-5)
+        command_mag = torch.clamp(self.commands[:, 0], min=0.05)
+        target_projection = torch.sum(target_vec_norm * cur_vel, dim=-1)
+        aligned_speed = torch.clamp(target_projection, -command_mag, command_mag)
+        rew = aligned_speed / (command_mag + 1e-5)
+
+        # 【关键修复】添加Y轴偏离惩罚，防止绕过栏杆
+        # 如果机器人横向偏离栏杆中心线超过阈值，减少奖励
+        if hasattr(self, "static_hurdle_info"):
+            robot_pos_xy = self.root_states[:, :2]
+            hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+
+            # 找到最近的前方栏杆
+            relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+            forward_distance = relative_pos[:, :, 0]
+
+            # 只考虑前方1-3米范围内的栏杆（即将接近的）
+            forward_mask = (forward_distance > 1.0) & (forward_distance < 3.0)
+
+            if forward_mask.any():
+                # 计算Y轴偏离
+                lateral_distance = relative_pos[:, :, 1]
+
+                # 找到前方1-3米内最近的栏杆
+                forward_distance_masked = forward_distance.clone()
+                forward_distance_masked[~forward_mask] = 999.0
+                min_dist, min_idx = torch.min(forward_distance_masked, dim=1)
+
+                # 获取该栏杆的Y轴偏离
+                nearest_lateral_offset = lateral_distance[
+                    torch.arange(self.num_envs, device=self.device), min_idx
+                ]
+
+                # Y轴偏离惩罚：超过0.3m（栏杆宽度0.5m + 安全余量）认为是绕行
+                lateral_penalty_threshold = 0.3  # 可配置
+                lateral_offset_abs = torch.abs(nearest_lateral_offset)
+
+                # 有前方栏杆的环境才应用惩罚
+                has_forward_hurdle = min_dist < 3.0
+
+                # 线性衰减：偏离越远，奖励越低
+                lateral_penalty = torch.clamp(
+                    (lateral_offset_abs - lateral_penalty_threshold)
+                    / lateral_penalty_threshold,
+                    0.0,
+                    1.0,
+                )
+
+                # 应用惩罚（将奖励乘以 1 - penalty）
+                rew = rew * (1.0 - 0.8 * lateral_penalty * has_forward_hurdle.float())
+
         return rew
 
     def _reward_tracking_yaw(self):
@@ -3184,6 +3412,96 @@ class LeggedRobot(BaseTask):
 
         return reward
 
+    def _reward_hurdle_progress_trapezoid(self):
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        robot_xy = self.root_states[:, :2]
+        hurdle_xy = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+
+        relative = hurdle_xy - robot_xy.unsqueeze(1)
+        forward_distance = relative[:, :, 0]
+        lateral_distance = relative[:, :, 1].abs()
+
+        fd_masked = forward_distance.clone()
+        placeholder_mask = hurdle_heights <= 0.05
+        fd_masked[placeholder_mask] = 999.0
+        fd_masked[fd_masked <= 0.0] = 999.0
+
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+        valid = min_dist < 998.0
+
+        if not torch.any(valid):
+            return reward
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        signed_dist = forward_distance[env_ids, min_idx]
+        lateral = lateral_distance[env_ids, min_idx]
+        heights = hurdle_heights[env_ids, min_idx]
+
+        approach_params = getattr(self.cfg.rewards, "trapezoid_approach", [1.4, 0.45])
+        exit_params = getattr(self.cfg.rewards, "trapezoid_exit", [0.35, 1.2])
+        plateau_half = getattr(self.cfg.rewards, "trapezoid_plateau_half", 0.12)
+        align_sigma = getattr(self.cfg.rewards, "trapezoid_alignment_sigma", 0.25)
+        min_speed = getattr(self.cfg.rewards, "trapezoid_min_speed", 0.35)
+        stall_penalty = getattr(self.cfg.rewards, "trapezoid_stall_penalty", 0.5)
+
+        approach_far = max(float(approach_params[0]), float(approach_params[1]) + 1e-4)
+        approach_near = max(float(approach_params[1]), plateau_half + 1e-4)
+        exit_near = max(float(exit_params[0]), plateau_half + 1e-4)
+        exit_far = max(float(exit_params[1]), exit_near + 1e-4)
+
+        base = torch.zeros_like(signed_dist)
+
+        mask_approach = (signed_dist <= approach_far) & (signed_dist > approach_near)
+        base[mask_approach] = (approach_far - signed_dist[mask_approach]) / (
+            approach_far - approach_near + 1e-6
+        )
+
+        mask_preplateau = (signed_dist <= approach_near) & (signed_dist > plateau_half)
+        base[mask_preplateau] = 1.0
+
+        plateau_mask = (signed_dist >= -plateau_half) & (signed_dist <= plateau_half)
+        base[plateau_mask] = 1.0
+
+        exit_core_mask = (signed_dist < -plateau_half) & (signed_dist >= -exit_near)
+        base[exit_core_mask] = 1.0
+
+        exit_ramp_mask = (signed_dist < -exit_near) & (signed_dist >= -exit_far)
+        base[exit_ramp_mask] = (exit_far + signed_dist[exit_ramp_mask]) / (
+            exit_far - exit_near + 1e-6
+        )
+
+        base = torch.clamp(base, min=0.0)
+
+        forward_vel = self.base_lin_vel[:, 0]
+        speed_score = torch.clamp(forward_vel / (min_speed + 1e-6), 0.0, 1.2)
+        speed_score = torch.where(speed_score > 1.0, torch.ones_like(speed_score), speed_score)
+
+        alignment = torch.exp(-torch.square(lateral / (align_sigma + 1e-6)))
+
+        high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.45)
+        height_gain = torch.where(heights >= high_threshold, 1.15, 1.0)
+
+        reward_value = base * alignment * speed_score * height_gain
+        reward_value = reward_value * valid.float()
+
+        stall_mask = valid & (torch.abs(signed_dist) < approach_far) & (forward_vel < 0.08)
+        if torch.any(stall_mask):
+            stall_scale = (approach_far - torch.abs(signed_dist[stall_mask])) / (
+                approach_far + 1e-6
+            )
+            speed_deficit = torch.clamp(0.08 - forward_vel[stall_mask], min=0.0) / 0.08
+            reward_value[stall_mask] -= stall_penalty * stall_scale * speed_deficit
+
+        reward_value = torch.clamp(reward_value, min=-stall_penalty, max=2.5)
+        reward[valid] = reward_value[valid]
+
+        return reward
+
     def _reward_feet_air_time(self):
         """
         奖励适当的腾空时间，鼓励良好的步态
@@ -3217,61 +3535,56 @@ class LeggedRobot(BaseTask):
 
     def _reward_base_height_stability(self):
         """
-        奖励维持合理的基座高度
-        根据当前情况（平地、钻过）动态调整目标高度
+        奖励基座高度适应当前障碍环境：
+        - 平地/低栏保持正常站立高度
+        - 接近高栏时提前降低身体高度以钻过
         """
-        # 获取机器人基座高度（相对于地面）
-        robot_z = self.root_states[:, 2]
 
-        # 初始化目标高度（默认为钻过模式的低姿态）
-        target_heights = torch.ones(
-            self.num_envs, dtype=torch.float, device=self.device
-        ) * getattr(self.cfg.rewards, "base_height_target", 0.18)
+        base_normal = getattr(self.cfg.rewards, "base_height_normal", 0.35)
+        crawl_target = getattr(self.cfg.rewards, "base_height_target", 0.25)
+        high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.35)
+        detection_range = getattr(
+            self.cfg.rewards, "height_guidance_detection_range", 1.2
+        )
 
-        # 检测是否在障碍物附近，动态调整目标高度
-        robot_pos = self.root_states[:, :3]
-        robot_x = robot_pos[:, 0]
-        robot_y = robot_pos[:, 1]
+        target_heights = torch.full(
+            (self.num_envs,),
+            base_normal,
+            dtype=torch.float,
+            device=self.device,
+        )
 
-        # 检查虚拟横杆（钻过模式）
-        if (
-            hasattr(self.terrain, "virtual_crossbars")
-            and len(self.terrain.virtual_crossbars) > 0
-        ):
-            for env_idx in range(self.num_envs):
-                env_origin = self.env_origins[env_idx]
-                rel_robot_x = robot_x[env_idx] - env_origin[0]
-                rel_robot_y = robot_y[env_idx] - env_origin[1]
+        if hasattr(self, "static_hurdle_info"):
+            robot_xy = self.root_states[:, :2]
+            relative = self.static_hurdle_info[:, :, :2] - robot_xy.unsqueeze(1)
+            forward_dist = relative[:, :, 0]
+            valid_forward = forward_dist > 0.0
 
-                for crossbar in self.terrain.virtual_crossbars:
-                    crossbar_x = crossbar["x"]
-                    crossbar_y = crossbar["y"]
-                    crossbar_width = crossbar["width"]
-                    crossbar_depth = crossbar["depth"]
+            if torch.any(valid_forward):
+                forward_masked = torch.where(
+                    valid_forward,
+                    forward_dist,
+                    torch.full_like(forward_dist, 1.0e6),
+                )
+                min_dist, min_idx = torch.min(forward_masked, dim=1)
+                nearest_height = self.static_hurdle_info[
+                    torch.arange(self.num_envs, device=self.device), min_idx, 2
+                ]
 
-                    # 在障碍物附近（前后1米）时，调整目标高度
-                    x_distance = abs(rel_robot_x - crossbar_x)
-                    y_in_range = abs(rel_robot_y - crossbar_y) < (crossbar_width / 2)
+                near_high = (min_dist < detection_range) & (
+                    nearest_height >= high_threshold
+                )
+                target_heights = torch.where(
+                    near_high,
+                    torch.full_like(target_heights, crawl_target),
+                    target_heights,
+                )
 
-                    if x_distance < 1.0 and y_in_range:
-                        # 接近障碍物时，目标高度保持低姿态
-                        target_heights[env_idx] = getattr(
-                            self.cfg.rewards, "base_height_target", 0.18
-                        )
-                        break
+        robot_height = self.root_states[:, 2] - self.env_origins[:, 2]
+        height_error = torch.abs(robot_height - target_heights)
 
-        # 计算实际高度与目标高度的差异
-        for env_idx in range(self.num_envs):
-            env_origin = self.env_origins[env_idx]
-            ground_z = env_origin[2]
-            robot_height = robot_z[env_idx] - ground_z
-            target_heights[env_idx] = target_heights[env_idx]
-
-        # 计算高度误差
-        height_error = torch.abs(robot_z - self.env_origins[:, 2] - target_heights)
-
-        # 使用高斯奖励：误差越小，奖励越高
-        reward = torch.exp(-height_error * 10.0)
+        shaping_gain = getattr(self.cfg.rewards, "base_height_stability_gain", 8.0)
+        reward = torch.exp(-shaping_gain * height_error)
 
         return reward
 
@@ -3321,48 +3634,322 @@ class LeggedRobot(BaseTask):
 
     def _reward_excessive_leg_width(self):
         """
-        惩罚左右腿距离过大（Y轴方向距离超过500mm）
+        优化：动态腿宽引导奖励/惩罚（接近栏杆时主动收拢双腿）
 
-        这个惩罚的目的是：
-        1. 防止机器人左右腿张开过大，导致与栏杆侧柱碰撞
-        2. 栏杆宽度为500mm，左右腿的跨度不应超过这个距离
-        3. 鼓励机器人保持紧凑的姿态通过栏杆
+        改进策略：
+        1. 远离栏杆时：只惩罚超过500mm的过宽姿态
+        2. 接近栏杆时（钻爬阶段）：奖励腿宽收拢到350-400mm的紧凑姿态
+        3. 越过栏杆后：恢复正常宽度，避免过度收拢影响稳定性
+
+        这样可以防止机器人双腿被两侧立柱卡住！
         """
         # 获取所有脚的位置 [num_envs, num_feet, 3]
         feet_pos = self.rigid_body_states[:, self.feet_indices, :3]
 
-        # 初始化惩罚
-        penalty = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        # 初始化奖励（可正可负）
+        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
-        # 宽度限制（单位：米）
-        max_width = getattr(self.cfg.rewards, "max_leg_width", 0.5)  # 500mm
+        # 参数配置
+        max_width = getattr(self.cfg.rewards, "max_leg_width", 0.5)  # 500mm最大宽度
+        target_width_near_hurdle = getattr(
+            self.cfg.rewards, "target_leg_width_near_hurdle", 0.4
+        )  # 350mm目标宽度（接近栏杆时）
+        hurdle_detection_range = getattr(
+            self.cfg.rewards, "leg_width_detection_range", 1.5
+        )  # 1.5m内开始引导
 
-        # 假设脚的顺序是：[FL, FR, RL, RR] 或类似的左右对称排列
-        # 通常前两只是前腿，后两只是后腿
+        # 假设脚的顺序是：[FL, FR, RL, RR]
         num_feet = len(self.feet_indices)
 
         if num_feet >= 4:
-            # 对每个环境计算前腿和后腿的Y轴距离
-            for env_idx in range(self.num_envs):
-                # 前两只脚（前腿）
-                front_left_y = feet_pos[env_idx, 0, 1]
-                front_right_y = feet_pos[env_idx, 1, 1]
-                front_width = torch.abs(front_left_y - front_right_y)
+            # 计算前腿和后腿的Y轴宽度（向量化）
+            front_left_y = feet_pos[:, 0, 1]
+            front_right_y = feet_pos[:, 1, 1]
+            front_width = torch.abs(front_left_y - front_right_y)
 
-                # 后两只脚（后腿）
-                rear_left_y = feet_pos[env_idx, 2, 1]
-                rear_right_y = feet_pos[env_idx, 3, 1]
-                rear_width = torch.abs(rear_left_y - rear_right_y)
+            rear_left_y = feet_pos[:, 2, 1]
+            rear_right_y = feet_pos[:, 3, 1]
+            rear_width = torch.abs(rear_left_y - rear_right_y)
 
-                # 如果前腿宽度超过限制
-                if front_width > max_width:
-                    excess = front_width - max_width
-                    penalty[env_idx] += excess / max_width
+            # 平均腿宽
+            avg_width = (front_width + rear_width) / 2.0
 
-                # 如果后腿宽度超过限制
-                if rear_width > max_width:
-                    excess = rear_width - max_width
-                    penalty[env_idx] += excess / max_width
+            # 检查是否接近栏杆
+            if hasattr(self, "static_hurdle_info"):
+                robot_pos_xy = self.root_states[:, :2]
+                hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+                hurdle_heights = self.static_hurdle_info[:, :, 2]
+
+                # 计算到最近栏杆的距离
+                relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+                forward_distance = relative_pos[:, :, 0]
+                fd_masked = forward_distance.clone()
+                fd_masked[fd_masked <= 0.0] = 999.0
+                min_dist, min_idx = torch.min(fd_masked, dim=1)
+                nearest_h = hurdle_heights[
+                    torch.arange(self.num_envs, device=self.device), min_idx
+                ]
+
+                # 判断是否在栏杆附近（前后±detection_range）
+                # 包括即将到达和刚越过的区域
+                signed_dist = forward_distance[
+                    torch.arange(self.num_envs, device=self.device), min_idx
+                ]
+                near_hurdle = torch.abs(signed_dist) < hurdle_detection_range
+
+                # 区分高栏和低栏（高栏需要钻爬，更需要收腿）
+                high_hurdle_mask = nearest_h >= getattr(
+                    self.cfg.rewards, "high_hurdle_threshold", 0.35
+                )
+
+                for env_idx in range(self.num_envs):
+                    if near_hurdle[env_idx]:
+                        # 接近栏杆时：引导收拢到目标宽度
+                        current_width = avg_width[env_idx]
+
+                        # 计算距离权重（越近越重要）
+                        dist_weight = torch.clamp(
+                            1.0
+                            - torch.abs(signed_dist[env_idx]) / hurdle_detection_range,
+                            0.0,
+                            1.0,
+                        )
+
+                        if high_hurdle_mask[env_idx]:
+                            # 高栏（钻爬）：强烈引导收腿到350mm
+                            target = target_width_near_hurdle
+                            tolerance = 0.05  # ±5cm容忍度
+
+                            # 高斯奖励：越接近目标越好
+                            width_error = torch.abs(current_width - target)
+                            if width_error < tolerance:
+                                # 在容忍范围内：给正奖励
+                                reward[env_idx] = (
+                                    torch.exp(-torch.square(width_error / tolerance))
+                                    * dist_weight
+                                )
+                            elif current_width > max_width:
+                                # 超过最大宽度：强惩罚（会被卡住！）
+                                excess = current_width - max_width
+                                reward[env_idx] = (
+                                    -2.0 * excess / max_width * dist_weight
+                                )
+                            elif current_width > target + tolerance:
+                                # 宽度过大但未超限：中等惩罚
+                                excess = current_width - (target + tolerance)
+                                reward[env_idx] = (
+                                    -1.0 * excess / max_width * dist_weight
+                                )
+                            else:
+                                # 过窄（小于目标-tolerance）：轻微惩罚（避免过度收拢）
+                                deficit = (target - tolerance) - current_width
+                                reward[env_idx] = -0.3 * deficit / target * dist_weight
+                        else:
+                            # 低栏（跳跃/爬）：温和引导，不过分要求收腿
+                            target = target_width_near_hurdle + 0.05  # 400mm
+
+                            if current_width > max_width:
+                                # 超过最大宽度：惩罚
+                                excess = current_width - max_width
+                                reward[env_idx] = (
+                                    -1.5 * excess / max_width * dist_weight
+                                )
+                            elif current_width < target:
+                                # 已经够窄：小奖励
+                                reward[env_idx] = 0.5 * dist_weight
+                            else:
+                                # 稍微过宽：小惩罚
+                                excess = current_width - target
+                                reward[env_idx] = (
+                                    -0.5 * excess / max_width * dist_weight
+                                )
+                    else:
+                        # 远离栏杆时：只惩罚过宽（超过500mm）
+                        current_width = avg_width[env_idx]
+                        if current_width > max_width:
+                            excess = current_width - max_width
+                            reward[env_idx] = -1.0 * excess / max_width
+            else:
+                # 没有栏杆信息：回退到原始逻辑（只惩罚过宽）
+                for env_idx in range(self.num_envs):
+                    current_width = avg_width[env_idx]
+                    if current_width > max_width:
+                        excess = current_width - max_width
+                        reward[env_idx] = -1.0 * excess / max_width
+
+        return reward
+
+    def _reward_feet_clearance(self):
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        hurdle_abs_pos = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        robot_pos_xy = self.root_states[:, :2]
+        relative_pos = hurdle_abs_pos - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+
+        fd_masked = forward_distance.clone()
+        fd_masked[fd_masked <= 0.0] = 999.0
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+
+        nearest_h = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+        nearest_x = hurdle_abs_pos[
+            torch.arange(self.num_envs, device=self.device), min_idx, 0
+        ]
+
+        valid = min_dist < 999.0
+        high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.45)
+        active = valid & (nearest_h < high_threshold)
+        if not torch.any(active):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        feet_pos = self.rigid_body_states[:, self.feet_indices, :3]
+        front_pos = feet_pos[:, 0:2, :]
+
+        margin = getattr(self.cfg.rewards, "foot_clearance_margin", 0.05)
+        tol = getattr(self.cfg.rewards, "foot_clearance_tolerance", 0.05)
+        front_window = max(
+            getattr(self.cfg.rewards, "foot_clearance_front_window", 0.35), 1e-3
+        )
+        front_clearance = getattr(
+            self.cfg.rewards, "rear_follow_front_clearance", 0.05
+        )
+
+        nearest_x_exp = nearest_x.unsqueeze(1)
+        nearest_h_exp = nearest_h.unsqueeze(1)
+
+        dx = nearest_x_exp - front_pos[:, :, 0]
+        in_window = (dx > -front_clearance) & (dx < front_window)
+        weight = torch.exp(-torch.square(dx / front_window)) * in_window.float()
+
+        height_target = nearest_h_exp + margin
+        height_error = torch.abs(front_pos[:, :, 2] - height_target)
+        height_score = torch.exp(-torch.square(height_error / (tol + 1e-6)))
+
+        numerator = (weight * height_score).sum(dim=1)
+        denom = weight.sum(dim=1) + 1e-6
+        base_reward = numerator / denom
+
+        distance_weight = torch.exp(-torch.square(min_dist / (front_window + 1e-6)))
+
+        reward = base_reward * distance_weight
+        reward = reward * active.float()
+
+        return reward
+
+    def _reward_rear_leg_follow(self):
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        hurdle_abs_pos = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        robot_pos_xy = self.root_states[:, :2]
+        relative_pos = hurdle_abs_pos - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+
+        fd_masked = forward_distance.clone()
+        fd_masked[fd_masked <= 0.0] = 999.0
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+
+        nearest_h = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+        nearest_x = hurdle_abs_pos[
+            torch.arange(self.num_envs, device=self.device), min_idx, 0
+        ]
+
+        valid = min_dist < 999.0
+        high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.45)
+        margin = getattr(self.cfg.rewards, "foot_clearance_margin", 0.05)
+        tol = getattr(self.cfg.rewards, "foot_clearance_tolerance", 0.05)
+        rear_window = max(
+            getattr(self.cfg.rewards, "rear_follow_window", 0.35), 1e-3
+        )
+        front_clearance = getattr(
+            self.cfg.rewards, "rear_follow_front_clearance", 0.05
+        )
+
+        active = valid & (nearest_h < high_threshold)
+        if not torch.any(active):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        feet_pos = self.rigid_body_states[:, self.feet_indices, :3]
+        front_pos = feet_pos[:, 0:2, :]
+        rear_pos = feet_pos[:, 2:4, :]
+
+        front_passed = (
+            front_pos[:, :, 0] > (nearest_x.unsqueeze(1) + front_clearance)
+        ).any(dim=1)
+
+        dx_rear = nearest_x.unsqueeze(1) - rear_pos[:, :, 0]
+        rear_mask = (dx_rear > -front_clearance) & (dx_rear < rear_window)
+        weight = torch.exp(-torch.square(dx_rear / rear_window)) * rear_mask.float()
+
+        height_target = nearest_h.unsqueeze(1) + margin
+        height_error = torch.abs(rear_pos[:, :, 2] - height_target)
+        height_score = torch.exp(-torch.square(height_error / (tol + 1e-6)))
+
+        numerator = (weight * height_score).sum(dim=1)
+        denom = weight.sum(dim=1) + 1e-6
+        base_reward = numerator / denom
+
+        distance_weight = torch.exp(-torch.square(min_dist / (rear_window + 1e-6)))
+
+        reward = base_reward * distance_weight
+        reward = reward * active.float() * front_passed.float()
+
+        return reward
+
+    def _reward_feet_drag_penalty(self):
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        hurdle_abs_pos = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        robot_pos_xy = self.root_states[:, :2]
+        relative_pos = hurdle_abs_pos - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+
+        fd_masked = forward_distance.clone()
+        fd_masked[fd_masked <= 0.0] = 999.0
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+
+        nearest_h = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+        nearest_x = hurdle_abs_pos[
+            torch.arange(self.num_envs, device=self.device), min_idx, 0
+        ]
+
+        valid = min_dist < 999.0
+        high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.45)
+        active = valid & (nearest_h < high_threshold)
+        if not torch.any(active):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        feet_pos = self.rigid_body_states[:, self.feet_indices, :3]
+        rear_pos = feet_pos[:, 2:4, :]
+
+        margin = getattr(self.cfg.rewards, "foot_clearance_margin", 0.05)
+        drag_window = max(getattr(self.cfg.rewards, "foot_drag_window", 0.3), 1e-3)
+
+        dx_rear = nearest_x.unsqueeze(1) - rear_pos[:, :, 0]
+        rear_mask = (dx_rear > -drag_window) & (dx_rear < drag_window)
+        weight = rear_mask.float() * torch.exp(-torch.square(dx_rear / drag_window))
+
+        height_target = nearest_h.unsqueeze(1) + margin
+        deficit = torch.clamp(height_target - rear_pos[:, :, 2], min=0.0)
+
+        numerator = (weight * deficit / (margin + 1e-6)).sum(dim=1)
+        denom = weight.sum(dim=1) + 1e-6
+        penalty = numerator / denom
+
+        distance_weight = torch.exp(-torch.square(min_dist / (drag_window + 1e-6)))
+        penalty = penalty * distance_weight
+        penalty = penalty * active.float()
 
         return penalty
 
@@ -3564,6 +4151,290 @@ class LeggedRobot(BaseTask):
         reward = reward * speed_gate
 
         return reward
+
+    def _reward_successful_traversal(self):
+        """
+        【新增】奖励成功穿越栏杆（Y轴对准良好）
+
+        设计目的：
+        1. 当机器人越过栏杆后，检查是否Y轴偏离很小
+        2. 如果偏离小于阈值，给予大额正奖励
+        3. 直接奖励"穿越"行为，而不是"绕过"行为
+        """
+        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        if not hasattr(self, "static_hurdle_info"):
+            return reward
+
+        robot_pos_xy = self.root_states[:, :2]
+        hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+
+        # 计算相对位置
+        relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+        lateral_distance = relative_pos[:, :, 1]
+
+        # 找到刚刚越过的栏杆（X距离为负且最近）
+        # 范围：-0.5m 到 0m（刚越过）
+        just_passed_mask = (forward_distance > -0.5) & (forward_distance < 0.0)
+
+        for env_idx in range(self.num_envs):
+            if not just_passed_mask[env_idx].any():
+                continue
+
+            # 找到最近的刚越过的栏杆
+            passed_distances = forward_distance[env_idx].clone()
+            passed_distances[~just_passed_mask[env_idx]] = -999.0
+            closest_passed_idx = torch.argmax(passed_distances)  # 最接近0的负值
+
+            # 检查Y轴偏离
+            y_offset = torch.abs(lateral_distance[env_idx, closest_passed_idx])
+
+            # 如果Y轴偏离小于0.3m（对准良好），给予奖励
+            traversal_threshold = 0.3
+            if y_offset < traversal_threshold:
+                # 线性奖励：偏离越小，奖励越大
+                reward[env_idx] = (
+                    1.0 - y_offset / traversal_threshold
+                ) * 2.0  # 最大奖励2.0
+
+        return reward
+
+    def _reward_jump_preload(self):
+        """
+        优化：高栏（>=350mm）跳跃：横杆前的蓄力阶段引导（降低重心，为起跳储能）
+
+        仅在接近高栏且仍未到达横杆（前向距离在窗口内）时，引导机器人：
+        1. 降低重心（身体下蹲）
+        2. 四足着地（保持稳定）
+        3. 保持前进动量（不停滞）
+        """
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 最近前方栏杆
+        robot_pos_xy = self.root_states[:, :2]
+        hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+        fd_masked = forward_distance.clone()
+        fd_masked[fd_masked <= 0.0] = 999.0
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+        nearest_h = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+
+        # 仅高栏
+        high_mask = nearest_h >= getattr(
+            self.cfg.rewards, "high_hurdle_threshold", 0.35
+        )
+        if not torch.any(high_mask):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 优化：扩大的距离窗口（更早开始蓄力）
+        w_far, w_near = getattr(self.cfg.rewards, "preload_window", [1.2, 0.4])
+        in_window = (min_dist <= w_far) & (min_dist >= w_near)
+        active = high_mask & in_window
+
+        if not torch.any(active):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 优化：更深的下蹲目标（为起跳储能）
+        base_normal = getattr(self.cfg.rewards, "base_height_normal", 0.35)
+        drop = getattr(self.cfg.rewards, "preload_height_drop", 0.08)
+        preload_target = base_normal - drop  # 目标：27cm（正常35cm - 8cm）
+        robot_h = self.root_states[:, 2] - self.env_origins[:, 2]
+
+        # 奖励1：高度达标（高斯成形，容忍度±5cm）
+        tol = 0.05
+        height_error = torch.abs(robot_h - preload_target)
+        height_score = torch.exp(-torch.square(height_error / tol))
+
+        # 奖励2：距离权重（越接近横杆，蓄力越重要）
+        distance_weight = torch.clamp(
+            (w_far - min_dist) / (w_far - w_near + 1e-6), 0.0, 1.0
+        )
+
+        # 奖励3：足部接触（要求至少3只脚着地，确保稳定）
+        foot_contact = (self.contact_forces[:, self.feet_indices, 2] > 10.0).float()
+        contact_count = foot_contact.sum(dim=1)
+        contact_score = torch.clamp(contact_count / 4.0, 0.0, 1.0)  # 4脚满分
+
+        # 优化：新增奖励4：保持前进速度（避免停滞观望）
+        forward_vel = torch.clamp(self.base_lin_vel[:, 0], 0.0, 2.0)
+        vel_score = torch.clamp(forward_vel / 0.4, 0.0, 1.0)  # 0.4m/s为目标速度
+
+        # 综合奖励
+        rew = (
+            0.5 * height_score  # 下蹲最重要
+            + 0.3 * contact_score  # 稳定性次之
+            + 0.2 * vel_score  # 保持前进
+        ) * distance_weight
+
+        rew *= active.float()
+        return rew
+
+    def _reward_jump_tuck_clearance(self):
+        """
+        优化：高栏（>=350mm）跳跃：横杆附近的收腿与越杆清空奖励
+
+        在横杆附近（±clearance_window）且机器人跳跃时：
+        - 核心奖励1：足部清空（足部最低点高于横杆+margin）
+        - 核心奖励2：腿部收拢（大腿屈、膝关节屈）
+        - 新增奖励3：身体高度达标（CoM高于横杆+额外余量）
+        - 新增奖励4：前向速度保持（避免停滞）
+        """
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        robot_pos_xy = self.root_states[:, :2]
+        robot_h = self.root_states[:, 2] - self.env_origins[:, 2]
+        hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+        fd_abs = forward_distance.abs()
+        fd_masked = forward_distance.clone()
+        fd_masked[fd_masked <= 0.0] = 999.0
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+        nearest_h = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+
+        high_mask = nearest_h >= getattr(
+            self.cfg.rewards, "high_hurdle_threshold", 0.35
+        )
+        win = getattr(self.cfg.rewards, "clearance_window", 0.25)
+        # 与最近栏杆的实际前向距离（含符号）
+        signed_dist = forward_distance[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+        near_crossbar = (
+            fd_abs[torch.arange(self.num_envs, device=self.device), min_idx] <= win
+        )
+        active = high_mask & near_crossbar
+        if not torch.any(active):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 优化：放宽跳跃判断（身体接近横杆高度即可，不要求完全超过）
+        height_threshold = 0.9  # 身体高度达到横杆90%即可触发奖励
+        attempting_jump = robot_h > (nearest_h * height_threshold)
+
+        # 奖励1：足部清空（关键！）
+        margin = getattr(self.cfg.rewards, "clearance_margin", 0.05)
+        feet_pos = self.rigid_body_states[:, self.feet_indices, :3]
+        min_foot_z = feet_pos[:, :, 2].min(dim=1).values
+        clearance_ok = (min_foot_z > (nearest_h + margin)).float()
+
+        # 奖励2：收腿动作（关键！）
+        thigh_pos = self.dof_pos[:, self.thigh_indices]
+        calf_pos = self.dof_pos[:, self.calf_indices]
+        # 优化：更合理的收腿评分，考虑四条腿的平均值
+        # 大腿前抬（正向），小腿后折（负向）
+        thigh_score = torch.clamp(thigh_pos.mean(dim=1), 0.0, 1.5) / 1.5
+        calf_score = torch.clamp(-calf_pos.mean(dim=1), 0.0, 2.0) / 2.0
+        tuck_score = 0.6 * thigh_score + 0.4 * calf_score
+
+        # 新增奖励3：身体高度达标（CoM足够高）
+        com_height_target = nearest_h + 0.10  # 目标：身体CoM高于横杆10cm
+        height_error = torch.abs(robot_h - com_height_target)
+        height_score = torch.exp(-5.0 * height_error)  # 高斯成形
+
+        # 新增奖励4：保持前向动量（避免停滞）
+        forward_vel = torch.clamp(self.base_lin_vel[:, 0], 0.0, 2.0)
+        vel_score = torch.clamp(forward_vel / 0.5, 0.0, 1.0)  # 0.5m/s为目标速度
+
+        # 距离权重：越靠近横杆中心越强
+        distance_weight = torch.exp(-torch.square(signed_dist / (win + 1e-6)))
+
+        # 综合奖励（加权组合）
+        rew = (
+            0.4 * clearance_ok  # 足部清空（最重要）
+            + 0.3 * tuck_score  # 收腿动作（次重要）
+            + 0.2 * height_score  # 身体高度
+            + 0.1 * vel_score  # 前向速度
+        ) * distance_weight
+
+        rew *= (active & attempting_jump).float()
+        return rew
+
+    def _reward_landing_stability(self):
+        """
+        优化：高栏（>=350mm）跳跃：越过横杆后的落地稳定奖励
+
+        在横杆之后的窗口内评估：
+        1. 足部接触（至少双足，越多越好）
+        2. 姿态稳定（角速度小、竖直速度收敛）
+        3. 身体高度恢复（回到正常站立高度）
+        4. 继续前进（保持前向动量）
+        """
+        if not hasattr(self, "static_hurdle_info"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        robot_pos_xy = self.root_states[:, :2]
+        robot_h = self.root_states[:, 2] - self.env_origins[:, 2]
+        hurdle_abs_pos_xy = self.static_hurdle_info[:, :, :2]
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        relative_pos = hurdle_abs_pos_xy - robot_pos_xy.unsqueeze(1)
+        forward_distance = relative_pos[:, :, 0]
+        fd_masked = forward_distance.clone()
+        fd_masked[fd_masked <= 0.0] = 999.0
+        min_dist, min_idx = torch.min(fd_masked, dim=1)
+        nearest_h = hurdle_heights[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+
+        high_mask = nearest_h >= getattr(
+            self.cfg.rewards, "high_hurdle_threshold", 0.35
+        )
+
+        # 优化：扩大落地评估窗口（更长的稳定期）
+        post_far, post_near = getattr(
+            self.cfg.rewards, "post_landing_window", [0.8, 0.1]
+        )
+        # 最近栏杆的带符号距离（负表示已越过）
+        signed_dist = forward_distance[
+            torch.arange(self.num_envs, device=self.device), min_idx
+        ]
+        in_post = (signed_dist < -post_near) & (signed_dist > -post_far)
+        active = high_mask & in_post
+        if not torch.any(active):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        # 奖励1：足部接触（越多越好）
+        foot_contact = (self.contact_forces[:, self.feet_indices, 2] > 30.0).float()
+        contact_count = foot_contact.sum(dim=1)
+        contact_score = torch.clamp(contact_count / 4.0, 0.0, 1.0)  # 4脚满分
+
+        # 奖励2：姿态稳定（Roll/Pitch角速度小）
+        ang_vel = torch.norm(self.base_ang_vel[:, :2], dim=1)
+        ang_score = torch.exp(-5.0 * ang_vel)
+
+        # 奖励3：竖直速度收敛（避免弹跳）
+        z_vel = torch.abs(self.base_lin_vel[:, 2])
+        z_score = torch.exp(-5.0 * z_vel)
+
+        # 优化：新增奖励4：身体高度恢复到正常站立
+        base_normal = getattr(self.cfg.rewards, "base_height_normal", 0.35)
+        height_error = torch.abs(robot_h - base_normal)
+        height_score = torch.exp(-10.0 * height_error)
+
+        # 优化：新增奖励5：保持前向速度（不因落地而停滞）
+        forward_vel = torch.clamp(self.base_lin_vel[:, 0], 0.0, 2.0)
+        vel_score = torch.clamp(forward_vel / 0.6, 0.0, 1.0)  # 0.6m/s为目标
+
+        # 综合奖励（加权组合）
+        rew = (
+            0.3 * contact_score  # 足部接触
+            + 0.25 * ang_score  # 角速度稳定
+            + 0.2 * z_score  # 竖直速度收敛
+            + 0.15 * height_score  # 高度恢复
+            + 0.1 * vel_score  # 保持前进
+        )
+
+        rew *= active.float()
+        return rew
 
     def _reward_strategic_height(self):
         """根据障碍物高度引导机器人选择策略：平地站立/高栏钻爬/低栏自由探索"""

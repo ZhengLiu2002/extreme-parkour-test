@@ -42,11 +42,17 @@ import wandb
 
 def train(args):
     args.headless = True
+    # 验证必需参数
+    if args.exptid is None:
+        raise ValueError("必须提供 --exptid 参数！例如: --exptid galileo_teacher")
     log_pth = LEGGED_GYM_ROOT_DIR + "/logs/{}/".format(args.proj_name) + args.exptid
+    print(f"模型将保存到: {log_pth}")
     try:
-        os.makedirs(log_pth)
-    except:
-        pass
+        os.makedirs(log_pth, exist_ok=True)
+        print(f"✓ 日志目录已创建: {log_pth}")
+    except Exception as e:
+        print(f"✗ 创建日志目录失败: {e}")
+        raise
     if args.debug:
         mode = "disabled"
         args.rows = 10
