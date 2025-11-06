@@ -262,7 +262,7 @@ class Terrain:
                 # 跳跃课程 (Jump Curriculum): 高度从低到高
                 # level 0 (difficulty=0.0) -> 50mm
                 # level 7 (difficulty=1.0) -> 350mm
-                min_height = 0.0  # 0mm
+                min_height = 0.05  # 50mm
                 max_height = 0.35  # 350mm
                 height = min_height + difficulty * (max_height - min_height)
                 height_range = [height, height]  # 固定高度（每个level对应一个高度）
@@ -270,7 +270,7 @@ class Terrain:
                 # 钻爬课程 (Crawl Curriculum): 高度从高到低（难度递增）
                 # level 0 (difficulty=0.0) -> 600mm（极容易钻过）
                 # level 7 (difficulty=1.0) -> 350mm（最低，需要极低姿态）
-                max_height = 0.80  # 800mm
+                max_height = 0.60  # 600mm
                 min_height = 0.35  # 350mm
                 height = max_height - difficulty * (max_height - min_height)
                 height_range = [height, height]  # 固定高度
@@ -960,7 +960,7 @@ def h_hurdle_terrain(
 
     # 几何体组件尺寸定义
     post_radius = 0.008  # 立柱半径 [米]
-    # 立柱间距应该使用传入的post_spacing参数，而不是hardcode
+    # 【修复】立柱间距应该使用传入的post_spacing参数，而不是hardcode
     # post_distance = 0.5  # 旧版：硬编码，导致与横梁长度不一致
 
     crossbar_radius = 0.005  # 横梁半径 [米]
@@ -1002,10 +1002,8 @@ def h_hurdle_terrain(
         # 选择当前栏杆的可通过高度（上横杆下端到下横杆上端的距离）
         if custom_heights is not None and i < len(custom_heights):
             passable_height = custom_heights[i]
-        elif (
-            progressive_heights
-            and progressive_sequence is not None
-            and i < len(progressive_sequence)
+        elif progressive_heights and progressive_sequence is not None and i < len(
+            progressive_sequence
         ):
             passable_height = progressive_sequence[i]
         else:
@@ -1017,7 +1015,7 @@ def h_hurdle_terrain(
         hurdle_z = 0.0  # 地面高度
 
         # 计算立柱位置（沿Y轴分布）
-        # 使用post_spacing而不是post_distance，保持与横梁长度一致
+        # 【修复】使用post_spacing而不是post_distance，保持与横梁长度一致
         left_post_y = hurdle_y - post_spacing / 2  # 左侧立柱
         right_post_y = hurdle_y + post_spacing / 2  # 右侧立柱
 
@@ -1025,10 +1023,10 @@ def h_hurdle_terrain(
         bottom_bar_height = 0.05  # 底部横杆中心高度（5cm）
         bottom_bar_offset_x = 0.0  # 底部横杆在X轴前移0cm（避免与立柱连接成墙）
         bottom_bar_radius = 0.005  # 底部横杆半径（0.5cm）
-        # 底部横杆长度应该与立柱间距一致
+        # 【修复】底部横杆长度应该与立柱间距一致
         bottom_bar_length = effective_spacing
 
-        # 根据可通过高度计算顶部横杆和立柱高度
+        # 【关键修正】根据可通过高度计算顶部横杆和立柱高度
         # 定义：可通过高度 = 上横杆下端 - 下横杆上端
         # 即：passable_height = (crossbar_height - crossbar_radius) - (bottom_bar_height + bottom_bar_radius)
         # 推导：crossbar_height = passable_height + bottom_bar_height + bottom_bar_radius + crossbar_radius

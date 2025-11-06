@@ -122,7 +122,7 @@ class LeggedRobot(BaseTask):
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
         self.post_physics_step()
 
-        # 【新增】初始化课程学习管理器
+        # 初始化课程学习管理器
         self._init_curriculum_manager()
 
     def step(self, actions):
@@ -356,6 +356,25 @@ class LeggedRobot(BaseTask):
     def reindex(self, vec):
         return vec[:, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]]
 
+    def _trapezoid_shaping(self, value, start, peak_start, peak_end, end):
+        """梯形奖励成形函数，start < peak_start < peak_end < end."""
+
+        denom_up = max(peak_start - start, 1.0e-6)
+        denom_down = max(end - peak_end, 1.0e-6)
+
+        result = torch.zeros_like(value)
+
+        ascending = (value >= start) & (value < peak_start)
+        result[ascending] = (value[ascending] - start) / denom_up
+
+        plateau = (value >= peak_start) & (value <= peak_end)
+        result[plateau] = 1.0
+
+        descending = (value > peak_end) & (value < end)
+        result[descending] = 1.0 - (value[descending] - peak_end) / denom_down
+
+        return torch.clamp(result, 0.0, 1.0)
+
     def _check_stuck(self):
         """
         检测机器人是否被栏杆卡住
@@ -431,6 +450,25 @@ class LeggedRobot(BaseTask):
         # 【新增】卡住检测
         stuck_cutoff = self._check_stuck()
 
+        trench_cutoff = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+        walkway_width = getattr(self.cfg.terrain, "walkway_width", 0.0)
+        trench_depth = getattr(self.cfg.terrain, "trench_depth", 0.0)
+        if walkway_width > 0.0 and trench_depth > 0.0:
+            walkway_half = walkway_width * 0.5 + 0.05  # 给机器人略微的容错区间
+            lateral_offset = torch.abs(self.root_states[:, 1] - self.env_origins[:, 1])
+
+            expected_height = getattr(self.cfg.init_state, "pos", [0.0, 0.0, 0.0])[2]
+            height_threshold = expected_height - trench_depth * 0.8
+            # 若课程配置导致高度阈值过低，保留一个最小值
+            height_threshold = min(expected_height, max(0.05, height_threshold))
+            z_relative = self.root_states[:, 2] - self.env_origins[:, 2]
+
+            trench_cutoff = (lateral_offset > walkway_half) & (
+                z_relative < height_threshold
+            )
+
+        self.extras["fell_in_trench"] = trench_cutoff
+
         self.time_out_buf = (
             self.episode_length_buf > self.max_episode_length
         )  # no terminal reward for time-outs
@@ -441,6 +479,7 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= pitch_cutoff
         self.reset_buf |= height_cutoff
         self.reset_buf |= stuck_cutoff
+        self.reset_buf |= trench_cutoff
 
     def reset_idx(self, env_ids):
         """Reset some environments.
@@ -962,9 +1001,7 @@ class LeggedRobot(BaseTask):
         goal_completion = self.cur_goal_idx[env_ids].float() / num_goals
         goal_completion = torch.clamp(goal_completion, 0.0, 1.0)
 
-        goal_threshold = getattr(
-            self.cfg.commands, "curriculum_goal_threshold", 0.4
-        )
+        goal_threshold = getattr(self.cfg.commands, "curriculum_goal_threshold", 0.4)
 
         # 记录平均目标完成度（而非纯粹靠存活时间）
         if goal_completion.numel() > 0:
@@ -999,7 +1036,11 @@ class LeggedRobot(BaseTask):
         else:
             current_max = float(current_range[1])
 
-        max_allowed = float(max_range[1]) if isinstance(max_range, (list, tuple)) else float(max_range)
+        max_allowed = (
+            float(max_range[1])
+            if isinstance(max_range, (list, tuple))
+            else float(max_range)
+        )
 
         if current_max >= max_allowed - 1e-6:
             # 已经达到上限
@@ -1009,7 +1050,9 @@ class LeggedRobot(BaseTask):
         if self.command_curriculum_increments:
             incr_val = self.command_curriculum_increments.get("lin_vel_x", increment)
             if isinstance(incr_val, (list, tuple)):
-                increment = float(incr_val[1]) if len(incr_val) > 1 else float(incr_val[0])
+                increment = (
+                    float(incr_val[1]) if len(incr_val) > 1 else float(incr_val[0])
+                )
             else:
                 increment = float(incr_val)
 
@@ -1172,7 +1215,7 @@ class LeggedRobot(BaseTask):
             # don't change on initial reset
             return
 
-        # 【关键修复】对于栏杆任务，使用目标点完成率而不是前进距离
+        # 对于栏杆任务，使用目标点完成率而不是前进距离
         # 原因：
         # 1. 栏杆任务总共约8-10米，但threshold计算需要6-20米
         # 2. 前进距离判断导致terrain_level永远不变
@@ -1181,7 +1224,7 @@ class LeggedRobot(BaseTask):
             self.cur_goal_idx[env_ids].float() / self.cfg.terrain.num_goals
         )
 
-        # 【关键修复】收紧课程升级条件，防止"绕过栏杆"就升级
+        # 收紧课程升级条件，防止"绕过栏杆"就升级
         # 原来的问题：level 0-2只需完成1/8 (12.5%)就升级，机器人可以绕过
         # 新策略：所有级别都需要完成至少50%的目标点，确保真正学会穿越
         current_level = self.terrain_levels[env_ids]
@@ -1770,15 +1813,6 @@ class LeggedRobot(BaseTask):
             self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
             # 使用更大的filter值确保碰撞生效
             robot_collision_filter = -1  # 使用-1作为全1位掩码（32位有符号整数）
-            # if i == 0:  # 只在第一个环境打印，避免过多输出
-            #     print(f"[DEBUG] 创建机器人 Actor (env={i}):")
-            #     print(f"  - collision_group = {i}")
-            #     print(
-            #         f"  - collision_filter = {robot_collision_filter} (二进制全1，32位整数)"
-            #     )
-            #     # 检查资产的形状数量
-            #     num_shapes = self.gym.get_asset_rigid_shape_count(robot_asset)
-            #     print(f"  - 机器人资产碰撞形状数量: {num_shapes}")
 
             # Isaac Gym API: create_actor(env, asset, pose, name, group, filter, segmentationId)
             # group: 碰撞组，相同组的actor会碰撞
@@ -1793,25 +1827,6 @@ class LeggedRobot(BaseTask):
                 robot_collision_filter,  # filter: 使用全1位掩码确保碰撞
                 0,  # segmentationId: 分割ID（用于可视化）
             )
-
-            # 验证创建后的actor属性（仅第一个环境）
-            # if i == 0:
-            #     # 获取actor的刚体数量
-            #     num_bodies = self.gym.get_actor_rigid_body_count(
-            #         env_handle, anymal_handle
-            #     )
-            #     print(f"  - 机器人Actor刚体数量: {num_bodies}")
-            #     # 获取actor的碰撞形状数量
-            #     num_actor_shapes = 0
-            #     for body_idx in range(num_bodies):
-            #         body_shape_props = self.gym.get_actor_rigid_shape_properties(
-            #             env_handle, anymal_handle
-            #         )
-            #         if body_idx < len(body_shape_props):
-            #             num_actor_shapes += 1
-            #     print(
-            #         f"  - 机器人Actor碰撞形状数量: {len(body_shape_props) if num_bodies > 0 else 0}"
-            #     )
 
             dof_props = self._process_dof_props(dof_props_asset, i)
             self.gym.set_actor_dof_properties(env_handle, anymal_handle, dof_props)
@@ -3297,6 +3312,28 @@ class LeggedRobot(BaseTask):
 
         print("=" * 80 + "\n")
 
+    def _reward_forward_progress_trapezoid(self):
+        """梯形速度成形：鼓励在可控速度区间内持续前进。"""
+
+        forward_speed = torch.clamp(self.base_lin_vel[:, 0], min=0.0)
+        speed_params = getattr(
+            self.cfg.rewards,
+            "progress_speed_trapezoid",
+            [0.18, 0.4, 0.75, 1.05],
+        )
+        p0, p1, p2, p3 = speed_params
+        speed_score = self._trapezoid_shaping(forward_speed, p0, p1, p2, p3)
+
+        heading_tol = getattr(self.cfg.rewards, "progress_heading_tolerance", 0.35)
+        heading_error = torch.abs(
+            getattr(self, "delta_yaw", torch.zeros_like(forward_speed))
+        )
+        heading_gate = torch.clamp(1.0 - heading_error / heading_tol, 0.0, 1.0)
+
+        alive_gate = 1.0 - self.reset_buf.float()
+
+        return speed_score * heading_gate * alive_gate
+
     def _reward_strategy_efficiency(self):
         """
         奖励根据障碍物高度选择高效策略
@@ -3367,171 +3404,178 @@ class LeggedRobot(BaseTask):
         """
         reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
-        # 获取机器人前进速度
-        forward_vel = self.base_lin_vel[:, 0]
-
-        # 检测是否在障碍物附近
-        is_near_obstacle = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
-
-        robot_pos = self.root_states[:, :3]
-        robot_x = robot_pos[:, 0]
-        robot_y = robot_pos[:, 1]
-
-        # 检查虚拟横杆
-        if (
-            hasattr(self.terrain, "virtual_crossbars")
-            and len(self.terrain.virtual_crossbars) > 0
-        ):
-            for env_idx in range(self.num_envs):
-                env_origin = self.env_origins[env_idx]
-                rel_robot_x = robot_x[env_idx] - env_origin[0]
-
-                for crossbar in self.terrain.virtual_crossbars:
-                    crossbar_x = crossbar["x"]
-                    distance_to_obstacle = abs(rel_robot_x - crossbar_x)
-
-                    if distance_to_obstacle < 1.0:  # 1米范围内
-                        is_near_obstacle[env_idx] = True
-                        break
-
-        # 合理速度范围：0.4-0.8 m/s
-        target_speed_low = 0.4
-        target_speed_high = 0.8
-
-        for env_idx in range(self.num_envs):
-            if is_near_obstacle[env_idx]:
-                vel = forward_vel[env_idx].item()
-                if target_speed_low <= vel <= target_speed_high:
-                    reward[env_idx] = 1.0
-                elif vel < target_speed_low:
-                    reward[env_idx] = vel / target_speed_low * 0.5
-                else:  # vel > target_speed_high
-                    reward[env_idx] = max(0, 1.0 - (vel - target_speed_high) / 0.5)
-
-        return reward
-
-    def _reward_hurdle_progress_trapezoid(self):
         if not hasattr(self, "static_hurdle_info"):
-            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-
-        reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-
-        robot_xy = self.root_states[:, :2]
-        hurdle_xy = self.static_hurdle_info[:, :, :2]
-        hurdle_heights = self.static_hurdle_info[:, :, 2]
-
-        relative = hurdle_xy - robot_xy.unsqueeze(1)
-        forward_distance = relative[:, :, 0]
-        lateral_distance = relative[:, :, 1].abs()
-
-        fd_masked = forward_distance.clone()
-        placeholder_mask = hurdle_heights <= 0.05
-        fd_masked[placeholder_mask] = 999.0
-        fd_masked[fd_masked <= 0.0] = 999.0
-
-        min_dist, min_idx = torch.min(fd_masked, dim=1)
-        valid = min_dist < 998.0
-
-        if not torch.any(valid):
             return reward
 
-        env_ids = torch.arange(self.num_envs, device=self.device)
-        signed_dist = forward_distance[env_ids, min_idx]
-        lateral = lateral_distance[env_ids, min_idx]
-        heights = hurdle_heights[env_ids, min_idx]
+        forward_speed = torch.clamp(self.base_lin_vel[:, 0], min=0.0)
+        speed_params = getattr(
+            self.cfg.rewards,
+            "approach_speed_trapezoid",
+            [0.12, 0.35, 0.7, 1.05],
+        )
+        s0, s1, s2, s3 = speed_params
+        speed_score = self._trapezoid_shaping(forward_speed, s0, s1, s2, s3)
 
-        approach_params = getattr(self.cfg.rewards, "trapezoid_approach", [1.4, 0.45])
-        exit_params = getattr(self.cfg.rewards, "trapezoid_exit", [0.35, 1.2])
-        plateau_half = getattr(self.cfg.rewards, "trapezoid_plateau_half", 0.12)
-        align_sigma = getattr(self.cfg.rewards, "trapezoid_alignment_sigma", 0.25)
-        min_speed = getattr(self.cfg.rewards, "trapezoid_min_speed", 0.35)
-        stall_penalty = getattr(self.cfg.rewards, "trapezoid_stall_penalty", 0.5)
+        hurdle_heights = self.static_hurdle_info[:, :, 2]
+        has_obstacle = hurdle_heights > 1.0e-4
 
-        approach_far = max(float(approach_params[0]), float(approach_params[1]) + 1e-4)
-        approach_near = max(float(approach_params[1]), plateau_half + 1e-4)
-        exit_near = max(float(exit_params[0]), plateau_half + 1e-4)
-        exit_far = max(float(exit_params[1]), exit_near + 1e-4)
+        relative = self.static_hurdle_info[:, :, :2] - self.root_states[
+            :, :2
+        ].unsqueeze(1)
+        forward_distance = relative[:, :, 0]
 
-        base = torch.zeros_like(signed_dist)
-
-        mask_approach = (signed_dist <= approach_far) & (signed_dist > approach_near)
-        base[mask_approach] = (approach_far - signed_dist[mask_approach]) / (
-            approach_far - approach_near + 1e-6
+        large_value = torch.full_like(forward_distance, 99.0)
+        forward_distance = torch.where(has_obstacle, forward_distance, large_value)
+        forward_distance = torch.where(
+            forward_distance > 0.0, forward_distance, large_value
         )
 
-        mask_preplateau = (signed_dist <= approach_near) & (signed_dist > plateau_half)
-        base[mask_preplateau] = 1.0
+        min_dist, _ = torch.min(forward_distance, dim=1)
+        has_forward_obstacle = min_dist < 50.0
 
-        plateau_mask = (signed_dist >= -plateau_half) & (signed_dist <= plateau_half)
-        base[plateau_mask] = 1.0
-
-        exit_core_mask = (signed_dist < -plateau_half) & (signed_dist >= -exit_near)
-        base[exit_core_mask] = 1.0
-
-        exit_ramp_mask = (signed_dist < -exit_near) & (signed_dist >= -exit_far)
-        base[exit_ramp_mask] = (exit_far + signed_dist[exit_ramp_mask]) / (
-            exit_far - exit_near + 1e-6
+        distance_params = getattr(
+            self.cfg.rewards,
+            "approach_distance_trapezoid",
+            [1.6, 1.0, 0.45, 0.15],
         )
+        d0, d1, d2, d3 = distance_params
+        distance_score = self._trapezoid_shaping(-min_dist, -d0, -d1, -d2, -d3)
 
-        base = torch.clamp(base, min=0.0)
-
-        forward_vel = self.base_lin_vel[:, 0]
-        speed_score = torch.clamp(forward_vel / (min_speed + 1e-6), 0.0, 1.2)
-        speed_score = torch.where(speed_score > 1.0, torch.ones_like(speed_score), speed_score)
-
-        alignment = torch.exp(-torch.square(lateral / (align_sigma + 1e-6)))
-
-        high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.45)
-        height_gain = torch.where(heights >= high_threshold, 1.15, 1.0)
-
-        reward_value = base * alignment * speed_score * height_gain
-        reward_value = reward_value * valid.float()
-
-        stall_mask = valid & (torch.abs(signed_dist) < approach_far) & (forward_vel < 0.08)
-        if torch.any(stall_mask):
-            stall_scale = (approach_far - torch.abs(signed_dist[stall_mask])) / (
-                approach_far + 1e-6
-            )
-            speed_deficit = torch.clamp(0.08 - forward_vel[stall_mask], min=0.0) / 0.08
-            reward_value[stall_mask] -= stall_penalty * stall_scale * speed_deficit
-
-        reward_value = torch.clamp(reward_value, min=-stall_penalty, max=2.5)
-        reward[valid] = reward_value[valid]
+        reward = speed_score * distance_score * has_forward_obstacle.float()
 
         return reward
+
+    # def _reward_feet_air_time(self):
+    #     """
+    #     奖励适当的腾空时间，鼓励良好的步态
+    #     - 腾空时间过短：步态僵硬，效率低
+    #     - 腾空时间适中：步态自然，效率高
+    #     - 腾空时间过长：可能是跳跃或失控
+    #     """
+    #     # 更新腾空时间
+    #     contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
+    #     contact_filt = torch.logical_or(contact, self.last_contacts)
+    #     self.last_contacts = contact
+
+    #     # 当脚接触地面时，记录腾空时间并重置
+    #     first_contact = (self.feet_air_time > 0.0) * contact_filt
+    #     self.feet_air_time += self.dt
+
+    #     # 理想的腾空时间范围：0.1-0.3秒
+    #     # 低于0.1秒：步态太快或拖地
+    #     # 高于0.3秒：可能在跳跃
+    #     rew_air_time = torch.sum(
+    #         (self.feet_air_time - 0.1) * first_contact, dim=1
+    #     )  # 奖励接近0.1秒的腾空时间
+
+    #     # 限制奖励范围，避免过长的腾空时间获得高奖励
+    #     rew_air_time = torch.clamp(rew_air_time, -0.5, 0.5)
+
+    #     # 重置已接触的脚的腾空时间
+    #     self.feet_air_time *= ~contact_filt
+
+    #     return rew_air_time
 
     def _reward_feet_air_time(self):
         """
-        奖励适当的腾空时间，鼓励良好的步态
-        - 腾空时间过短：步态僵硬，效率低
-        - 腾空时间适中：步态自然，效率高
-        - 腾空时间过长：可能是跳跃或失控
+        【修复】奖励适当的腾空时间，解决小步擦地问题
+
+        使用梯形奖励 (trapezoid shaping) 鼓励一个"健康"的腾空时间范围。
+        - 腾空时间过短 (如 < 0.1s)：惩罚 (即 擦地/ shuffling)
+        - 腾空时间适中 (如 0.15s - 0.25s)：高奖励
+        - 腾空时间过长 (如 > 0.4s)：惩罚 (失控的跳跃)
         """
-        # 更新腾空时间
+        # 1. 更新腾空时间
         contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
         contact_filt = torch.logical_or(contact, self.last_contacts)
         self.last_contacts = contact
 
-        # 当脚接触地面时，记录腾空时间并重置
-        first_contact = (self.feet_air_time > 0.0) * contact_filt
+        # 记录每只脚当前的腾空时间
         self.feet_air_time += self.dt
 
-        # 理想的腾空时间范围：0.1-0.3秒
-        # 低于0.1秒：步态太快或拖地
-        # 高于0.3秒：可能在跳跃
-        rew_air_time = torch.sum(
-            (self.feet_air_time - 0.1) * first_contact, dim=1
-        )  # 奖励接近0.1秒的腾空时间
+        # 2. 识别刚着地的脚
+        # first_contact: (N, 4) bool, True表示这只脚在这一步刚刚着地
+        first_contact = (self.feet_air_time > 0.0) * contact_filt
 
-        # 限制奖励范围，避免过长的腾空时间获得高奖励
-        rew_air_time = torch.clamp(rew_air_time, -0.5, 0.5)
+        # 3. 获取刚着地的脚的腾空时间
+        # air_time_at_contact: (N, 4), 记录了每只脚着地时的腾空时长
+        air_time_at_contact = self.feet_air_time * first_contact.float()
 
-        # 重置已接触的脚的腾空时间
+        # 4. 定义理想的腾空时间范围 (梯形)
+        # 0.1s以下 -> 惩罚
+        # 0.15s - 0.25s -> 满分奖励
+        # 0.4s以上 -> 惩罚
+        start = 0.05  # 低于 0.05s, 惩罚
+        peak_start = 0.15  # 0.15s 开始满分
+        peak_end = 0.25  # 0.25s 结束满分
+        end = 0.40  # 超过 0.40s, 惩罚
+
+        # 5. 应用梯形塑形
+        # (N, 4) -> (N, 4)
+        # 刚着地的脚会得到一个 [0, 1] 之间的分数，其他脚为 0
+        reward_shaping = self._trapezoid_shaping(
+            air_time_at_contact, start, peak_start, peak_end, end
+        )
+
+        # 修正：对于刚着地的脚，如果腾空时间在 (0, start) 之间（即擦地），
+        # _trapezoid_shaping 会返回0，但我们希望它返回负值（惩罚）
+
+        # (N, 4)
+        shuffling_penalty = (air_time_at_contact > 0.0) & (air_time_at_contact < start)
+        # (N, 4)
+        too_long_penalty = air_time_at_contact > end
+
+        # (N, 4) -> (N)
+        # 将所有脚的得分和惩罚相加
+        # - 健康步态 (0.15-0.25s) 的脚: +1.0
+        # - 擦地 (0.05s) 的脚: -1.0
+        # - 跳跃过高 (0.4s) 的脚: -1.0
+        # - 还在空中的脚: 0
+        total_reward = torch.sum(
+            reward_shaping
+            - shuffling_penalty.float() * 1.0
+            - too_long_penalty.float() * 1.0,
+            dim=1,
+        )
+
+        # 条件化奖励：只在非钻爬模式下应用此奖励
+        if hasattr(self, "static_hurdle_info"):
+            # 1. 检查机器人是否处于“钻爬模式” (即接近高栏杆)
+            # (复用 _reward_base_height_stability 中的逻辑)
+            high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.35)
+            detection_range = getattr(
+                self.cfg.rewards, "height_guidance_detection_range", 1.2
+            )
+
+            robot_xy = self.root_states[:, :2]
+            relative = self.static_hurdle_info[:, :, :2] - robot_xy.unsqueeze(1)
+            forward_dist = relative[:, :, 0]
+            valid_forward = forward_dist > 0.0
+
+            forward_masked = torch.where(
+                valid_forward,
+                forward_dist,
+                torch.full_like(forward_dist, 1.0e6),
+            )
+            min_dist, min_idx = torch.min(forward_masked, dim=1)
+
+            nearest_height = self.static_hurdle_info[
+                torch.arange(self.num_envs, device=self.device), min_idx, 2
+            ]
+
+            # (N,) bool: True 表示正在接近一个高栏杆 (需要钻爬)
+            is_near_high_hurdle = (min_dist < detection_range) & (
+                nearest_height >= high_threshold
+            )
+
+            # 2. 如果正在钻爬 (is_near_high_hurdle=True)，则禁用此奖励 (乘以 0)
+            #    否则 (平地或接近低栏)，正常应用此奖励 (乘以 1)
+            total_reward = total_reward * (~is_near_high_hurdle).float()
+
+        # 6. 重置已接触的脚的腾空时间
         self.feet_air_time *= ~contact_filt
 
-        return rew_air_time
+        return total_reward
 
     def _reward_base_height_stability(self):
         """
@@ -3814,9 +3858,7 @@ class LeggedRobot(BaseTask):
         front_window = max(
             getattr(self.cfg.rewards, "foot_clearance_front_window", 0.35), 1e-3
         )
-        front_clearance = getattr(
-            self.cfg.rewards, "rear_follow_front_clearance", 0.05
-        )
+        front_clearance = getattr(self.cfg.rewards, "rear_follow_front_clearance", 0.05)
 
         nearest_x_exp = nearest_x.unsqueeze(1)
         nearest_h_exp = nearest_h.unsqueeze(1)
@@ -3865,12 +3907,8 @@ class LeggedRobot(BaseTask):
         high_threshold = getattr(self.cfg.rewards, "high_hurdle_threshold", 0.45)
         margin = getattr(self.cfg.rewards, "foot_clearance_margin", 0.05)
         tol = getattr(self.cfg.rewards, "foot_clearance_tolerance", 0.05)
-        rear_window = max(
-            getattr(self.cfg.rewards, "rear_follow_window", 0.35), 1e-3
-        )
-        front_clearance = getattr(
-            self.cfg.rewards, "rear_follow_front_clearance", 0.05
-        )
+        rear_window = max(getattr(self.cfg.rewards, "rear_follow_window", 0.35), 1e-3)
+        front_clearance = getattr(self.cfg.rewards, "rear_follow_front_clearance", 0.05)
 
         active = valid & (nearest_h < high_threshold)
         if not torch.any(active):
@@ -4535,54 +4573,41 @@ class LeggedRobot(BaseTask):
         self.curriculum_success_buffer = []  # 成功率统计缓冲区
 
         # 加载阶段配置
+        # 【简化】只保留实际使用的参数：vel_range, success_threshold, min_iterations
+        # 注意：terrain_types, obstacle_heights, num_obstacles, obstacle_spacing 已被删除
+        # 因为这些参数从未被实际使用，地形由 terrain.py 和 _update_terrain_curriculum() 控制
         self.curriculum_stages = [
             {
                 "name": self.cfg.curriculum.stage1_name,
-                "terrain_types": self.cfg.curriculum.stage1_terrain_types,
-                "obstacle_heights": self.cfg.curriculum.stage1_obstacle_heights,
-                "num_obstacles": self.cfg.curriculum.stage1_num_obstacles,
                 "vel_range": self.cfg.curriculum.stage1_vel_range,
                 "success_threshold": self.cfg.curriculum.stage1_success_threshold,
                 "min_iterations": self.cfg.curriculum.stage1_min_iterations,
-                "obstacle_spacing": [2.5, 3.0],  # 阶段1无障碍，默认值
             },
             {
                 "name": self.cfg.curriculum.stage2_name,
-                "terrain_types": self.cfg.curriculum.stage2_terrain_types,
-                "obstacle_heights": self.cfg.curriculum.stage2_obstacle_heights,
-                "num_obstacles": self.cfg.curriculum.stage2_num_obstacles,
                 "vel_range": self.cfg.curriculum.stage2_vel_range,
                 "success_threshold": self.cfg.curriculum.stage2_success_threshold,
                 "min_iterations": self.cfg.curriculum.stage2_min_iterations,
-                "obstacle_spacing": self.cfg.curriculum.stage2_obstacle_spacing,
             },
             {
                 "name": self.cfg.curriculum.stage3_name,
-                "terrain_types": self.cfg.curriculum.stage3_terrain_types,
-                "obstacle_heights": self.cfg.curriculum.stage3_obstacle_heights,
-                "num_obstacles": self.cfg.curriculum.stage3_num_obstacles,
                 "vel_range": self.cfg.curriculum.stage3_vel_range,
                 "success_threshold": self.cfg.curriculum.stage3_success_threshold,
                 "min_iterations": self.cfg.curriculum.stage3_min_iterations,
-                "obstacle_spacing": self.cfg.curriculum.stage3_obstacle_spacing,
             },
             {
                 "name": self.cfg.curriculum.stage4_name,
-                "terrain_types": self.cfg.curriculum.stage4_terrain_types,
-                "obstacle_heights": self.cfg.curriculum.stage4_obstacle_heights,
-                "num_obstacles": self.cfg.curriculum.stage4_num_obstacles,
                 "vel_range": self.cfg.curriculum.stage4_vel_range,
                 "success_threshold": self.cfg.curriculum.stage4_success_threshold,
                 "min_iterations": self.cfg.curriculum.stage4_min_iterations,
-                "obstacle_spacing": self.cfg.curriculum.stage4_obstacle_spacing,
             },
         ]
 
         # 应用第一阶段配置
         self._apply_curriculum_stage(0)
 
-        # print(f"[课程学习] 已启用，共{len(self.curriculum_stages)}个阶段")
-        # print(f"[课程学习] 当前阶段: 阶段1 - {self.curriculum_stages[0]['name']}")
+        print(f"[课程学习] 已启用，共{len(self.curriculum_stages)}个阶段")
+        print(f"[课程学习] 当前阶段: 阶段1 - {self.curriculum_stages[0]['name']}")
 
     def _apply_curriculum_stage(self, stage_idx):
         """应用指定阶段的课程配置"""
@@ -4599,9 +4624,6 @@ class LeggedRobot(BaseTask):
 
         # print(f"\n{'='*80}")
         # print(f"[课程学习] 切换到阶段{stage_idx + 1}: {stage['name']}")
-        # print(f"  - 地形类型: {stage['terrain_types']}")
-        # print(f"  - 障碍物高度: {stage['obstacle_heights']}")
-        # print(f"  - 障碍物数量: {stage['num_obstacles']}")
         # print(f"  - 速度范围: {stage['vel_range']} m/s")
         # print(f"  - 成功率阈值: {stage['success_threshold']}")
         # print(f"  - 最少训练迭代: {stage['min_iterations']}")
@@ -4645,12 +4667,12 @@ class LeggedRobot(BaseTask):
 
                 if avg_success >= stage["success_threshold"]:
                     # 进入下一阶段
-                    # print(f"\n[课程学习] 阶段{self.curriculum_stage + 1}完成！")
-                    # print(f"  - 训练迭代: {self.curriculum_iteration}")
-                    # print(
-                    #     f"  - 平均成功率: {avg_success:.2%} (阈值: {stage['success_threshold']:.2%})"
-                    # )
-                    pass
+                    print(f"\n[课程学习] 阶段{self.curriculum_stage + 1}完成！")
+                    print(f"  - 训练迭代: {self.curriculum_iteration}")
+                    print(
+                        f"  - 平均成功率: {avg_success:.2%} (阈值: {stage['success_threshold']:.2%})"
+                    )
+                    # pass
 
                     # 切换到下一阶段
                     self.curriculum_success_buffer.clear()

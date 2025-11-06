@@ -8,21 +8,59 @@
 **Paper**: https://arxiv.org/abs/2309.14341  
 **Tweet Summary**: https://twitter.com/pathak2206/status/1706696237703901439
 
-### Installation ###
+### Installation
+
+We provide installation instructions for different NVIDIA GPU series. Please choose the one that matches your hardware.
+
+**For NVIDIA 30-series GPUs (e.g., RTX 3090) and older:**
+
+This is the original setup used in the paper.
+
 ```bash
 conda create -n parkour python=3.8
 conda activate parkour
-cd
+# The following command installs PyTorch 1.10.0 with CUDA 11.3
 pip3 install torch==1.10.0+cu113 torchvision==0.11.1+cu113 torchaudio==0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
+# Clone the repository
 git clone git@github.com:chengxuxin/extreme-parkour.git
 cd extreme-parkour
-# Download the Isaac Gym binaries from https://developer.nvidia.com/isaac-gym 
-# Originally trained with Preview3, but haven't seen bugs using Preview4.
+# Download and install Isaac Gym
+# Download the Isaac Gym binaries from https://developer.nvidia.com/isaac-gym
+# We used Preview 3 for training, but Preview 4 should also work.
 cd isaacgym/python && pip install -e .
+# Install other dependencies
 cd ~/extreme-parkour/rsl_rl && pip install -e .
 cd ~/extreme-parkour/legged_gym && pip install -e .
 pip install "numpy<1.24" pydelatin wandb tqdm opencv-python ipdb pyfqmr flask
 ```
+
+**For NVIDIA 40-series (e.g., RTX 4060, 4090) and 50-series (e.g., RTX 5090) GPUs:**
+
+Newer GPUs require newer versions of CUDA and PyTorch for compatibility and performance.
+
+```bash
+conda create -n parkour python=3.8
+conda activate parkour
+# Install a newer version of PyTorch. You can choose between CUDA 11.8 and 12.1.
+# For CUDA 12.1:
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Or for CUDA 11.8:
+# pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Clone the repository
+git clone git@github.com:chengxuxin/extreme-parkour.git
+cd extreme-parkour
+# Download and install Isaac Gym
+# Download the Isaac Gym binaries from https://developer.nvidia.com/isaac-gym
+# We used Preview 3 for training, but Preview 4 should also work. It is compatible with newer PyTorch versions.
+cd isaacgym/python && pip install -e .
+# Install other dependencies
+cd ~/extreme-parkour/rsl_rl && pip install -e .
+cd ~/extreme-parkour/legged_gym && pip install -e .
+pip install "numpy<1.24" pydelatin wandb tqdm opencv-python ipdb pyfqmr flask
+```
+
+pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
 
 ### Usage ###
 `cd legged_gym/scripts`

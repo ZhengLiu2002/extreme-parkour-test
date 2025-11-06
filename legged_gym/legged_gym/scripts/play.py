@@ -68,49 +68,79 @@ def play(args):
     # override some parameters for testing
     if args.nodelay:
         env_cfg.domain_rand.action_delay_view = 0
-    # 优化：设置5列固定地形，分别展示200/300/400/500/混合栏杆
-    env_cfg.env.num_envs = 5 if not args.save else 64
     env_cfg.env.episode_length_s = 60
-    env_cfg.commands.resampling_time = 60
-    env_cfg.terrain.num_rows = 1
-    env_cfg.terrain.num_cols = 5  # 5列：200mm, 300mm, 400mm, 500mm, 混合
-    env_cfg.terrain.height = [0.02, 0.02]
-    env_cfg.terrain.terrain_dict = {
-        "smooth slope": 0.0,
-        "rough slope up": 0.0,
-        "rough slope down": 0.0,
-        "rough stairs up": 0.0,
-        "rough stairs down": 0.0,
-        "discrete": 0.0,
-        "stepping stones": 0.0,
-        "gaps": 0.0,
-        "smooth flat": 0,
-        "pit": 0.0,
-        "wall": 0.0,
-        "platform": 0.0,
-        "large stairs up": 0.0,
-        "large stairs down": 0.0,
-        "parkour": 0.0,
-        "parkour_hurdle": 0.0,
-        "parkour_flat": 0.0,
-        "parkour_step": 0.0,
-        "parkour_gap": 0.0,
-        "demo": 0.0,
-        "h_hurdle": 1.0,
-    }
+    env_cfg.commands.resampling_time = env_cfg.env.episode_length_s
 
-    env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
-    env_cfg.terrain.curriculum = False
-    env_cfg.terrain.max_difficulty = True
+    terrain_mode = getattr(args, "terrain_mode", "stage")
+    terrain_mode = terrain_mode.lower() if isinstance(terrain_mode, str) else "stage"
+    if terrain_mode not in {"stage", "demo"}:
+        print(f"[警告] 未识别的 terrain_mode='{terrain_mode}'，自动切换为stage模式。")
+        terrain_mode = "stage"
 
-    # 优化：为5列设置固定的栏杆高度
-    # 列0: 200mm固定高度
-    # 列1: 300mm固定高度
-    # 列2: 400mm固定高度
-    # 列3: 500mm固定高度
-    # 列4: 200-300-400-500mm递进混合
-    env_cfg.terrain.demo_heights = [0.05, 0.3, 0.4, 0.6, None]  # None表示混合模式
-    env_cfg.terrain.demo_progressive_cols = [4]  # 第4列使用递进模式
+    selected_stage_index = None
+    selected_terrain_type = None  # 用于保存 terrain_type (col)
+    if terrain_mode == "demo":
+        env_cfg.env.num_envs = 5 if not args.save else 64
+        env_cfg.terrain.num_rows = 1
+        env_cfg.terrain.num_cols = 5
+        env_cfg.terrain.curriculum = False
+        env_cfg.terrain.max_difficulty = False
+        env_cfg.terrain.height = [0.02, 0.02]
+        env_cfg.terrain.terrain_dict = {"h_hurdle": 1.0}
+        env_cfg.terrain.terrain_proportions = [1.0]
+        env_cfg.terrain.demo_heights = [0.20, 0.30, 0.40, 0.50, None]
+        env_cfg.terrain.demo_progressive_cols = [4]
+
+        # env_cfg.terrain.horizontal_scale = 0.10 # (原为 0.05)
+        # env_cfg.terrain.border_size = 1.0 # (原为 5.0)
+    else:
+        # 【stage模式】完全匹配训练时的地形配置，确保能正确反映训练中的地形
+        env_cfg.env.num_envs = 4 if not args.save else 64
+
+        # 使用与训练完全相同的配置
+        # 训练配置：num_rows=6, num_cols=4, curriculum=True, max_init_terrain_level=0
+        env_cfg.terrain.num_rows = 6  # 6个难度级别 (terrain_level: 0-5)
+        env_cfg.terrain.num_cols = 4  # 4种地形类型 (col 0,1=跳跃课程, col 2,3=钻爬课程)
+        env_cfg.terrain.curriculum = True  # 启用课程模式
+        env_cfg.terrain.max_difficulty = False
+        env_cfg.terrain.height = [0.02, 0.02]
+        env_cfg.terrain.terrain_dict = {"h_hurdle": 1.0}
+        env_cfg.terrain.terrain_proportions = [1.0]
+        env_cfg.terrain.demo_heights = [None]
+        env_cfg.terrain.demo_progressive_cols = []
+
+        # curriculum_stage 对应训练中的 terrain_level (0-5)
+        # difficulty = terrain_level / (num_rows - 1) = terrain_level / 5
+        stage_arg = getattr(args, "curriculum_stage", -1)
+        if stage_arg < 0:
+            # 默认使用最高难度 (terrain_level = 5)
+            selected_terrain_level = 5
+        else:
+            # 限制在有效范围内 (0-5)
+            selected_terrain_level = max(0, min(stage_arg, 5))
+
+        # 设置 max_init_terrain_level，但实际会在环境创建后固定为 selected_terrain_level
+        env_cfg.terrain.max_init_terrain_level = selected_terrain_level
+
+        # 计算对应的 difficulty
+        difficulty = (
+            selected_terrain_level / (env_cfg.terrain.num_rows - 1)
+            if env_cfg.terrain.num_rows > 1
+            else 0.0
+        )
+
+        # 可选：通过参数指定 terrain_type (col)，默认使用 col=0 (跳跃课程)
+        terrain_type = getattr(args, "terrain_type", 0)
+        terrain_type = max(0, min(terrain_type, env_cfg.terrain.num_cols - 1))
+
+        print(
+            f"[地形] stage模式 - terrain_level={selected_terrain_level}, "
+            f"difficulty={difficulty:.2f}, terrain_type(col)={terrain_type}"
+        )
+
+        # 保存这些值，以便在环境创建后使用
+        selected_stage_index = selected_terrain_level  # 为了兼容后续代码
+        selected_terrain_type = terrain_type
 
     env_cfg.depth.angle = [0, 1]
     env_cfg.noise.add_noise = True
@@ -124,6 +154,67 @@ def play(args):
     # prepare environment
     env: LeggedRobot
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+
+    # 【关键修复】在 stage 模式下，固定 terrain_levels 和 terrain_types
+    # 确保使用与训练时完全相同的 terrain_level 和 terrain_type
+    if terrain_mode == "stage" and selected_stage_index is not None:
+        if hasattr(env, "terrain_levels"):
+            # 固定所有环境使用 selected_terrain_level 对应的地形难度
+            env.terrain_levels[:] = selected_stage_index
+            print(f"[地形] 固定 terrain_levels = {selected_stage_index}")
+
+        if hasattr(env, "terrain_types") and selected_terrain_type is not None:
+            # 固定所有环境使用 selected_terrain_type 对应的地形类型
+            env.terrain_types[:] = selected_terrain_type
+            print(
+                f"[地形] 固定 terrain_types = {selected_terrain_type} (col {selected_terrain_type})"
+            )
+
+        # 更新环境原点和其他相关属性
+        if hasattr(env, "terrain_levels") and hasattr(env, "terrain_types"):
+            if hasattr(env, "terrain_origins"):
+                env.env_origins[:] = env.terrain_origins[
+                    env.terrain_levels, env.terrain_types
+                ]
+            if hasattr(env, "terrain_class"):
+                env.env_class[:] = env.terrain_class[
+                    env.terrain_levels, env.terrain_types
+                ]
+
+        if hasattr(env, "_apply_curriculum_stage") and hasattr(
+            env, "curriculum_stages"
+        ):
+            # terrain_level (selected_stage_index) 范围是 [0, 5] (来自 num_rows=6)
+            # curriculum.stages (用于速度) 范围是 [0, 3] (来自 galileo_parkour_config.py)
+            # 我们将 terrain_level 映射到 stage，以应用正确的速度配置
+            # 映射：[0, 1, 2, 3, 4, 5] -> [0, 1, 2, 3, 3, 3]
+            num_curriculum_stages = len(env.curriculum_stages)
+            clamped_stage_index = max(
+                0, min(selected_stage_index, num_curriculum_stages - 1)
+            )
+
+            if clamped_stage_index != selected_stage_index:
+                print(
+                    f"[速度] terrain_level {selected_stage_index} 超出 4 阶段速度课程范围，"
+                    f"已映射到 stage {clamped_stage_index}。"
+                )
+
+            env._apply_curriculum_stage(clamped_stage_index)
+
+            stage_info = env.get_curriculum_stage_info()
+            if stage_info:
+                print(
+                    f"[课程学习] 已应用: 阶段{stage_info['stage_index'] + 1} ({stage_info['stage_name']}) 的速度配置"
+                )
+
+        elif hasattr(env, "get_curriculum_stage_info"):
+            # 备用：如果 _apply_curriculum_stage 不可用，仍打印当前信息
+            stage_info = env.get_curriculum_stage_info()
+            if stage_info:
+                print(
+                    f"[课程学习] 当前阶段{stage_info['stage_index'] + 1}: {stage_info['stage_name']}"
+                )
+
     obs = env.get_observations()
 
     if args.web:
