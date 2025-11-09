@@ -262,7 +262,7 @@ class Terrain:
                 # 跳跃课程 (Jump Curriculum): 高度从低到高
                 # level 0 (difficulty=0.0) -> 50mm
                 # level 7 (difficulty=1.0) -> 350mm
-                min_height = 0.0  # 0mm
+                min_height = 0.05  # 0mm
                 max_height = 0.35  # 350mm
                 height = min_height + difficulty * (max_height - min_height)
                 height_range = [height, height]  # 固定高度（每个level对应一个高度）
@@ -328,7 +328,6 @@ class Terrain:
             pad_height=0,
             progressive_heights=use_progressive,
             post_spacing=post_spacing_cfg,
-            crossbar_inset=0.05,
             custom_heights=custom_heights,
             walkway_width=walkway_width_cfg,
             trench_depth=trench_depth_cfg,
@@ -452,10 +451,11 @@ class Terrain:
                 # 【修复】深拷贝 bottom_bar 子字典（如果存在）
                 if "bottom_bar" in hurdle_info:
                     hurdle_world["bottom_bar"] = {
-                        "radius": hurdle_info["bottom_bar"]["radius"],
                         "length": hurdle_info["bottom_bar"]["length"],
                         "height": hurdle_info["bottom_bar"]["height"],
                         "offset_x": hurdle_info["bottom_bar"]["offset_x"],
+                        "half_height": hurdle_info["bottom_bar"]["half_height"],
+                        "half_width": hurdle_info["bottom_bar"]["half_width"],
                         "color": hurdle_info["bottom_bar"]["color"],
                     }
 
@@ -901,14 +901,13 @@ def h_hurdle_terrain(
     total_goals=None,
     x_range=[1.5, 2.5],
     y_range=[0.0, 0.0],
-    height_range=[0.2, 0.5],  # 可通过高度范围（上横杆下端到下横杆上端）
+    height_range=[0.2, 0.5],  # 上横梁中心高度范围 [米]
     pad_width=0.1,
     pad_height=0.5,
     progressive_heights=True,
-    post_spacing=0.5,  # 两根立柱内侧距离（宽度）
-    crossbar_inset=0.0,
+    post_spacing=0.6,  # 两根立柱中心距
     custom_heights=None,
-    walkway_width=0.0,
+    walkway_width=0.1,
     trench_depth=0.0,
 ):
 
@@ -917,7 +916,7 @@ def h_hurdle_terrain(
         total_goals = num_hurdles + 2
     goals = np.zeros((total_goals, 2))
 
-    # 【改进】添加轻微地面噪声，增加真实性和鲁棒性
+    # 添加轻微地面噪声，增加真实性和鲁棒性
     # 而不是完全平坦的地面
     terrain.height_field_raw[:] = 0
 
@@ -946,11 +945,8 @@ def h_hurdle_terrain(
     goals[0] = [platform_len_px - 1, mid_y]
 
     # 可用的栏杆高度（标准高度）
-    available_heights = [0.2, 0.3, 0.4, 0.5]
-    if progressive_heights:
-        progressive_sequence = [0.2, 0.3, 0.4, 0.5]  # 递进高度序列
-    else:
-        progressive_sequence = None
+    crossbar_candidates = np.array([0.2, 0.3, 0.4, 0.5])  # 上横梁中心标准高度
+    progressive_crossbar_sequence = crossbar_candidates if progressive_heights else None
 
     if custom_heights is not None:
         custom_heights = list(custom_heights)
@@ -960,11 +956,10 @@ def h_hurdle_terrain(
 
     # 几何体组件尺寸定义
     post_radius = 0.008  # 立柱半径 [米]
-    # 立柱间距应该使用传入的post_spacing参数，而不是hardcode
-    # post_distance = 0.5  # 旧版：硬编码，导致与横梁长度不一致
 
     crossbar_radius = 0.005  # 横梁半径 [米]
-    effective_spacing = max(post_spacing - 2 * crossbar_inset, 0.1)
+    crossbar_inset = 0.0  # 兼容旧逻辑，横梁不再向内缩进
+    crossbar_length = 0.7  # 上横梁长度固定为700mm
 
     trenches_enabled = walkway_width > 0.0 and trench_depth > 0.0
     if trenches_enabled:
@@ -1001,15 +996,27 @@ def h_hurdle_terrain(
 
         # 选择当前栏杆的可通过高度（上横杆下端到下横杆上端的距离）
         if custom_heights is not None and i < len(custom_heights):
-            passable_height = custom_heights[i]
-        elif (
-            progressive_heights
-            and progressive_sequence is not None
-            and i < len(progressive_sequence)
+            crossbar_height = custom_heights[i]
+        elif progressive_crossbar_sequence is not None and i < len(
+            progressive_crossbar_sequence
         ):
-            passable_height = progressive_sequence[i]
+            crossbar_height = progressive_crossbar_sequence[i]
         else:
-            passable_height = np.random.uniform(height_range[0], height_range[1])
+            # 在允许范围内选择符合要求的标准高度
+            valid_mask = (crossbar_candidates >= height_range[0]) & (
+                crossbar_candidates <= height_range[1]
+            )
+            valid_candidates = crossbar_candidates[valid_mask]
+            if valid_candidates.size > 0:
+                crossbar_height = float(np.random.choice(valid_candidates))
+            else:
+                crossbar_height = float(
+                    np.clip(
+                        np.random.choice(crossbar_candidates),
+                        height_range[0],
+                        height_range[1],
+                    )
+                )
 
         # 计算栏杆在世界坐标系中的中心位置
         hurdle_x = dis_x * terrain.horizontal_scale
@@ -1022,18 +1029,19 @@ def h_hurdle_terrain(
         right_post_y = hurdle_y + post_spacing / 2  # 右侧立柱
 
         # 底部横杆参数
-        bottom_bar_height = 0.05  # 底部横杆中心高度（5cm）
-        bottom_bar_offset_x = 0.0  # 底部横杆在X轴前移0cm（避免与立柱连接成墙）
-        bottom_bar_radius = 0.005  # 底部横杆半径（0.5cm）
-        # 底部横杆长度应该与立柱间距一致
-        bottom_bar_length = effective_spacing
+        bottom_bar_height = 0.0  # 底部横杆中心高度（2cm）
+        bottom_bar_offset_x = 0.0  # 底部横杆在X轴偏移
+        bottom_bar_half_height = 0.01  # 长方体半高度（Z方向）
+        bottom_bar_half_width = 0.01  # 长方体半宽度（X方向）
+        inner_gap = max(post_spacing - 2 * post_radius, 0.0)
+        bottom_bar_length = max(inner_gap - 2 * bottom_bar_half_width, 0.0)  # Y方向长度
 
-        # 根据可通过高度计算顶部横杆和立柱高度
-        # 定义：可通过高度 = 上横杆下端 - 下横杆上端
-        # 即：passable_height = (crossbar_height - crossbar_radius) - (bottom_bar_height + bottom_bar_radius)
-        # 推导：crossbar_height = passable_height + bottom_bar_height + bottom_bar_radius + crossbar_radius
-        crossbar_height = (
-            passable_height + bottom_bar_height + bottom_bar_radius + crossbar_radius
+        # 计算以上横梁中心高度定义的可通过高度
+        passable_height = max(
+            crossbar_height
+            - crossbar_radius
+            - (bottom_bar_height + bottom_bar_half_height),
+            0.0,
         )
 
         # 立柱高度到横杆中心（即crossbar_height）
@@ -1058,17 +1066,18 @@ def h_hurdle_terrain(
             # 顶部横梁信息（悬空的水平圆柱，与立柱顶端平齐）
             "crossbar": {
                 "radius": crossbar_radius,
-                "length": effective_spacing,  # 横梁长度（等于立柱间距）
+                "length": crossbar_length,  # 横梁长度固定为700mm
                 "height": crossbar_height,  # 横梁Z坐标（中心高度）
-                "inset": crossbar_inset,  # 横梁向内缩进距离
+                "inset": crossbar_inset,  # 兼容旧字段
                 "color": [0.8, 0.2, 0.2],  # 红色
             },
             # 底部横杆信息（用来绊倒机器人，与横梁平行）
             "bottom_bar": {
-                "radius": bottom_bar_radius,
-                "length": bottom_bar_length,  # 底部横杆长度（等于立柱间距）
-                "height": bottom_bar_height,  # 底部横杆中心高度（5cm）
+                "length": bottom_bar_length,
+                "height": bottom_bar_height,
                 "offset_x": bottom_bar_offset_x,  # 在X轴偏移
+                "half_height": bottom_bar_half_height,
+                "half_width": bottom_bar_half_width,
                 "color": [0.2, 0.8, 0.2],  # 绿色
             },
         }

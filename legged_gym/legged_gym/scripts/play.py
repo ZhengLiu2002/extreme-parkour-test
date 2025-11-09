@@ -157,65 +157,20 @@ def play(args):
 
     # 【关键修复】在 stage 模式下，固定 terrain_levels 和 terrain_types
     # 确保使用与训练时完全相同的 terrain_level 和 terrain_type
-    if terrain_mode == "stage" and selected_stage_index is not None:
-        if hasattr(env, "terrain_levels"):
-            # 固定所有环境使用 selected_terrain_level 对应的地形难度
-            env.terrain_levels[:] = selected_stage_index
-            print(f"[地形] 固定 terrain_levels = {selected_stage_index}")
-
-        if hasattr(env, "terrain_types") and selected_terrain_type is not None:
-            # 固定所有环境使用 selected_terrain_type 对应的地形类型
-            env.terrain_types[:] = selected_terrain_type
-            print(
-                f"[地形] 固定 terrain_types = {selected_terrain_type} (col {selected_terrain_type})"
-            )
-
-        # 更新环境原点和其他相关属性
-        if hasattr(env, "terrain_levels") and hasattr(env, "terrain_types"):
-            if hasattr(env, "terrain_origins"):
-                env.env_origins[:] = env.terrain_origins[
-                    env.terrain_levels, env.terrain_types
-                ]
-            if hasattr(env, "terrain_class"):
-                env.env_class[:] = env.terrain_class[
-                    env.terrain_levels, env.terrain_types
-                ]
-
-        if hasattr(env, "_apply_curriculum_stage") and hasattr(
-            env, "curriculum_stages"
-        ):
-            # terrain_level (selected_stage_index) 范围是 [0, 5] (来自 num_rows=6)
-            # curriculum.stages (用于速度) 范围是 [0, 3] (来自 galileo_parkour_config.py)
-            # 我们将 terrain_level 映射到 stage，以应用正确的速度配置
-            # 映射：[0, 1, 2, 3, 4, 5] -> [0, 1, 2, 3, 3, 3]
-            num_curriculum_stages = len(env.curriculum_stages)
-            clamped_stage_index = max(
-                0, min(selected_stage_index, num_curriculum_stages - 1)
-            )
-
-            if clamped_stage_index != selected_stage_index:
-                print(
-                    f"[速度] terrain_level {selected_stage_index} 超出 4 阶段速度课程范围，"
-                    f"已映射到 stage {clamped_stage_index}。"
-                )
-
-            env._apply_curriculum_stage(clamped_stage_index)
-
-            stage_info = env.get_curriculum_stage_info()
-            if stage_info:
-                print(
-                    f"[课程学习] 已应用: 阶段{stage_info['stage_index'] + 1} ({stage_info['stage_name']}) 的速度配置"
-                )
-
-        elif hasattr(env, "get_curriculum_stage_info"):
-            # 备用：如果 _apply_curriculum_stage 不可用，仍打印当前信息
-            stage_info = env.get_curriculum_stage_info()
-            if stage_info:
-                print(
-                    f"[课程学习] 当前阶段{stage_info['stage_index'] + 1}: {stage_info['stage_name']}"
-                )
-
     obs = env.get_observations()
+
+    if terrain_mode == "stage" and selected_stage_index is not None:
+        print(
+            f"  [play.py] 强行锁定所有环境到 Level={selected_stage_index}, "
+            f"Type={selected_terrain_type}"
+        )
+        env.terrain_levels.fill_(selected_stage_index)
+        if selected_terrain_type is not None:
+            env.terrain_types.fill_(selected_terrain_type)
+        all_envs = torch.arange(env.num_envs, device=env.device)
+        env.reset_idx(all_envs)
+        env.cfg.terrain.curriculum = False
+        print("  [play.py] env.cfg.terrain.curriculum 已禁用。")
 
     if args.web:
         web_viewer.setup(env)

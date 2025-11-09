@@ -221,7 +221,7 @@ def get_args():
         {"name": "--web", "action": "store_true", "default": False, "help": "if use web viewer"},
         {"name": "--no_wandb", "action": "store_true", "default": False, "help": "no wandb"},
         {"name": "--terrain_mode", "type": str, "default": "stage", "help": "Terrain visualization mode when playing (stage/demo)"},
-        {"name": "--curriculum_stage", "type": int, "default": -1, "help": "Curriculum stage index (0-3) to visualize in stage mode; -1 means auto-select"}
+        {"name": "--curriculum_stage", "type": int, "default": -1, "help": "Terrain level index (0-5) to visualize in stage mode; -1 means auto-select"}
 
 
     ]

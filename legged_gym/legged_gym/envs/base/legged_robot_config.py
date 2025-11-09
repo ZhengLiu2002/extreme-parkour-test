@@ -338,31 +338,38 @@ class LeggedRobotCfg(BaseConfig):
 
     class rewards:
         class scales:
-            # tracking rewards
-            tracking_goal_vel = 1.5
-            tracking_yaw = 0.5
-            # regularization rewards
-            lin_vel_z = -1.0
-            ang_vel_xy = -0.05
-            orientation = -1.0
-            dof_acc = -2.5e-7
-            collision = -10.0
-            action_rate = -0.1
-            delta_torques = -1.0e-7
-            torques = -0.00001
-            hip_pos = -0.5
-            dof_error = -0.04
-            feet_stumble = -1
-            feet_edge = -1
+            forward_progress_trapezoid = 1.0
+            lin_vel_z = -0.02
+            ang_vel_xy = -0.04
+            orientation = -0.2
+            action_rate = -0.01
+            torques = -1.0e-6
+            collision = -0.15
+            feet_stumble = -1.5
+            stand_still = -0.1
+            termination = -2.0
+            alive_bonus = 0.25
+            centerline_alignment = 0.5
+            base_height_strategy = 0.8
+            feet_clearance_simple = -1.2
 
-        only_positive_rewards = True  # if true negative total rewards are clipped at zero (avoids early termination problems)
-        tracking_sigma = 0.2  # tracking reward = exp(-error^2/sigma)
-        soft_dof_pos_limit = (
-            1.0  # percentage of urdf limits, values above this limit are penalized
-        )
+        only_positive_rewards = False
+        tracking_sigma = 0.2  # legacy parameter, kept for backward compatibility
+        soft_dof_pos_limit = 1.0
         soft_dof_vel_limit = 1
         soft_torque_limit = 0.4
-        base_height_target = 1.0
+        base_height_target = 0.25
+        base_height_normal = 0.36
+        jump_height_target = 0.42
+        obstacle_detection_range = 1.5
+        base_height_high_threshold = 0.35
+        base_height_strategy_gain = 6.0
+        high_hurdle_threshold = 0.35
+        centerline_tolerance = 0.25
+        feet_clearance_height = 0.10
+        feet_clearance_window = 0.30
+        progress_speed_trapezoid = [0.18, 0.4, 0.75, 1.05]
+        progress_heading_tolerance = 0.35
         max_contact_force = 40.0  # forces above this value are penalized
 
     # viewer camera:

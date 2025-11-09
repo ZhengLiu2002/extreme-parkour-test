@@ -328,7 +328,6 @@ class Terrain:
             pad_height=0,
             progressive_heights=use_progressive,
             post_spacing=post_spacing_cfg,
-            crossbar_inset=0.05,
             custom_heights=custom_heights,
             walkway_width=walkway_width_cfg,
             trench_depth=trench_depth_cfg,
@@ -1002,8 +1001,10 @@ def h_hurdle_terrain(
         # 选择当前栏杆的可通过高度（上横杆下端到下横杆上端的距离）
         if custom_heights is not None and i < len(custom_heights):
             passable_height = custom_heights[i]
-        elif progressive_heights and progressive_sequence is not None and i < len(
-            progressive_sequence
+        elif (
+            progressive_heights
+            and progressive_sequence is not None
+            and i < len(progressive_sequence)
         ):
             passable_height = progressive_sequence[i]
         else:
@@ -1023,10 +1024,17 @@ def h_hurdle_terrain(
         bottom_bar_height = 0.05  # 底部横杆中心高度（5cm）
         bottom_bar_offset_x = 0.0  # 底部横杆在X轴前移0cm（避免与立柱连接成墙）
         bottom_bar_radius = 0.005  # 底部横杆半径（0.5cm）
-        # 【修复】底部横杆长度应该与立柱间距一致
-        bottom_bar_length = effective_spacing
+        
+        inner_distance = post_spacing - 2 * post_radius
 
-        # 【关键修正】根据可通过高度计算顶部横杆和立柱高度
+        # 底部横杆的圆柱(cylinder)部分长度 = 内部距离 - 两个半球半径 - 1mm容差
+        tolerance = 0.001 
+        cylinder_length = inner_distance - 2 * bottom_bar_radius - tolerance
+
+        # 确保最小长度，防止为负
+        bottom_bar_length = max(cylinder_length, 0.01)
+
+        # 根据可通过高度计算顶部横杆和立柱高度
         # 定义：可通过高度 = 上横杆下端 - 下横杆上端
         # 即：passable_height = (crossbar_height - crossbar_radius) - (bottom_bar_height + bottom_bar_radius)
         # 推导：crossbar_height = passable_height + bottom_bar_height + bottom_bar_radius + crossbar_radius

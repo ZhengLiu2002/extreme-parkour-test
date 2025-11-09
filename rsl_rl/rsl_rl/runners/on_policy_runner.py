@@ -33,7 +33,7 @@ import os
 from collections import deque
 import statistics
 
-# from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.optim as optim
 import wandb
@@ -133,9 +133,29 @@ class OnPolicyRunner:
         # Log
         self.log_dir = log_dir
         self.writer = None
+        if self.log_dir is not None:
+            tb_dir = os.path.join(self.log_dir, "tensorboard")
+            os.makedirs(tb_dir, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=tb_dir, flush_secs=10)
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+
+    def _write_tensorboard_scalars(self, data_dict, step):
+        if self.writer is None:
+            return
+        for key, value in data_dict.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    value = value.item()
+                else:
+                    continue
+            elif isinstance(value, (list, tuple, dict)):
+                continue
+            if isinstance(value, (int, float)):
+                tag = key.replace("/", "_")
+                self.writer.add_scalar(tag, value, step)
+        self.writer.flush()
 
     def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_value_loss = 0.0
@@ -147,9 +167,6 @@ class OnPolicyRunner:
         mean_priv_reg_loss = 0.0
         priv_reg_coef = 0.0
         entropy_coef = 0.0
-        # initialize writer
-        # if self.log_dir is not None and self.writer is None:
-        #     self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
@@ -275,6 +292,8 @@ class OnPolicyRunner:
                 self.log_dir, "model_{}.pt".format(self.current_learning_iteration)
             )
         )
+        if self.writer is not None:
+            self.writer.flush()
 
     def learn_vision(self, num_learning_iterations, init_at_random_ep_len=False):
         tot_iter = self.current_learning_iteration + num_learning_iterations
@@ -434,6 +453,9 @@ class OnPolicyRunner:
                 self.save(os.path.join(self.log_dir, "model_{}.pt".format(it)))
             ep_infos.clear()
 
+        if self.writer is not None:
+            self.writer.flush()
+
     def log_vision(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs["collection_time"] + locs["learn_time"]
@@ -474,6 +496,7 @@ class OnPolicyRunner:
             wandb_dict["Train/mean_episode_length"] = statistics.mean(locs["lenbuffer"])
 
         wandb.log(wandb_dict, step=locs["it"])
+        self._write_tensorboard_scalars(wandb_dict, locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
@@ -538,7 +561,7 @@ class OnPolicyRunner:
             / (locs["collection_time"] + locs["learn_time"])
         )
 
-        wandb_dict["Loss/value_function"] = ["mean_value_loss"]
+        wandb_dict["Loss/value_function"] = locs["mean_value_loss"]
         wandb_dict["Loss/surrogate"] = locs["mean_surrogate_loss"]
         wandb_dict["Loss/estimator"] = locs["mean_estimator_loss"]
         wandb_dict["Loss/hist_latent_loss"] = locs["mean_hist_latent_loss"]
@@ -569,6 +592,7 @@ class OnPolicyRunner:
             # wandb_dict['Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
 
         wandb.log(wandb_dict, step=locs["it"])
+        self._write_tensorboard_scalars(wandb_dict, locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 

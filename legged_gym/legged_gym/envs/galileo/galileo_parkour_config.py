@@ -7,10 +7,9 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobot
 class GalileoParkourCfg(LeggedRobotCfg):
     class env(LeggedRobotCfg.env):
         num_envs = 32
-        stuck_distance_threshold = (
-            0.05  # 【放宽】X轴前进距离小于5cm视为不动（从2cm放宽）
-        )
+        stuck_distance_threshold = 0.05  # X轴前进距离小于5cm视为不动
         stuck_time_threshold = 200
+        stuck_termination_multiplier = 4.0  # 卡住超过原阈值4倍时才强制终止
 
     class terrain(LeggedRobotCfg.terrain):
         num_rows = 6  # 6个难度级别，对应渐进课程阶段
@@ -19,50 +18,11 @@ class GalileoParkourCfg(LeggedRobotCfg):
         terrain_proportions = list(terrain_dict.values())
         num_goals = 8
         curriculum = True
-        max_init_terrain_level = 0  # 【关键】从最简单的level 0开始，避免一开始太难
+        max_init_terrain_level = 0  # 从最简单的level 0开始，避免一开始太难
         demo_heights = [None, None, None, None]
         demo_progressive_cols = []
         walkway_width = 0.8  # 中央跑道宽度（米）
-        trench_depth = 0.4  # 两侧壕沟深度（米）
-        # 【已禁用】hurdle_profiles 列表已注释，以激活基于col的跳跃/钻爬分离课程
-        # hurdle_profiles 的使用会导致 terrain.py 优先使用基于row的课程逻辑，
-        # 从而忽略基于col的跳跃/钻爬分离设计
-        # hurdle_profiles = [
-        #     {
-        #         "num_hurdles": 0,
-        #         "height_range": [0.0, 0.0],
-        #         "x_range": [2.4, 2.8],
-        #         "add_roughness": False,
-        #     },
-        #     {
-        #         "num_hurdles": 2,
-        #         "custom_heights": [0.20, 0.25],
-        #         "x_range": [2.3, 2.6],
-        #         "add_roughness": False,
-        #     },
-        #     {
-        #         "num_hurdles": 3,
-        #         "custom_heights": [0.20, 0.30, 0.35],
-        #         "x_range": [2.2, 2.5],
-        #     },
-        #     {
-        #         "num_hurdles": 4,
-        #         "custom_heights": [0.20, 0.30, 0.40, 0.50],
-        #         "x_range": [2.0, 2.4],
-        #     },
-        #     {
-        #         "num_hurdles": 4,
-        #         "custom_heights": [0.20, 0.30, 0.40, 0.50],
-        #         "x_range": [1.9, 2.3],
-        #         "post_spacing": 0.48,
-        #     },
-        #     {
-        #         "num_hurdles": 4,
-        #         "custom_heights": [0.20, 0.30, 0.40, 0.50],
-        #         "x_range": [1.8, 2.1],
-        #         "post_spacing": 0.45,
-        #     },
-        # ]
+        trench_depth = 0.8  # 两侧壕沟深度（米）
 
     class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 0.0, 0.42]  # 抬高初始高度，避免触地
@@ -85,8 +45,8 @@ class GalileoParkourCfg(LeggedRobotCfg):
         control_type = "P"
         stiffness = {"joint": 70.0}
         damping = {"joint": 1.5}
-        action_scale = 0.25
-        decimation = 4
+        action_scale = 0.4  # target angle = actionScale * action + defaultAngle
+        decimation = 5  # 40Hz
 
     class asset(LeggedRobotCfg.asset):
         file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/galileo_e1_v1d6_e1r/e1_v1d6_e1r.urdf"
@@ -100,97 +60,50 @@ class GalileoParkourCfg(LeggedRobotCfg):
         push_robots = False
 
     class rewards(LeggedRobotCfg.rewards):
-        only_positive_rewards = False
+        only_positive_rewards = False  # 是否将所有负奖励截断为0
 
         class scales:
-            tracking_goal_vel = 2.5
-            forward_progress_trapezoid = 1.0
-            tracking_yaw = 0.5
-            lin_vel_z = -0.02
-            ang_vel_xy = -0.04
-            orientation = -0.2
-            dof_acc = -2.5e-7
-            collision = -0.15
-            action_rate = -0.05
-            delta_torques = -1.0e-7
-            torques = -1.0e-5
-            dof_error = -0.02
-            feet_stumble = -1.5
-            feet_edge = -0.5
-            feet_contact_forces = -0.01
-            stand_still = -0.1
-            termination = -2.0
-            body_obstacle_contact = -1.0
-            base_height_stability = 0.8
-            height_based_guidance = 0.85
-            hurdle_alignment = 0.45
-            strategy_efficiency = 0.6
-            obstacle_approach_speed = 0.25
-            feet_air_time = 0.8
-            excessive_leg_width = 0.3
-            feet_clearance = 1.5
-            rear_leg_follow = 0.8
-            feet_drag_penalty = -2.0
-            successful_traversal = 3.0
-            alive_bonus = 0.25
+            forward_progress_trapezoid = 2.0  # 基于梯形积分的前进速度奖励
+            lin_vel_z = -0.02  # 垂直速度惩罚
+            ang_vel_xy = -0.04  # 横滚/俯仰角速度惩罚
+            orientation = -0.2  # 姿态偏差惩罚
+            action_rate = -0.01  # 连续动作差分惩罚（平滑控制）
+            torques = -1.0e-6  # 扭矩幅值惩罚，抑制过大驱动
+            collision = -0.15  # 非脚部碰撞惩罚
+            feet_stumble = -1.5  # 脚部被底杆绊住惩罚
+            stand_still = -0.1  # 原地不动惩罚
+            termination = -2.0  # 终止惩罚
+            alive_bonus = 0.25  # 存活奖励
+            centerline_alignment = 0.5  # 保持赛道中心
+            base_height_strategy = 0.8  # 根据障碍调整基座高度
+            feet_clearance_simple = -1.2  # 底杆附近抬脚不足惩罚
+            feet_air_time = 0.3  # 鼓励合适的腾空时间，避免碎步
 
-        soft_dof_pos_limit = 0.9
-        base_height_target = 0.25
-        base_height_normal = 0.36
-        height_guidance_detection_range = 2.0
-        base_height_stability_gain = 6.0
-        obstacle_contact_force_threshold = 5.0
-        low_hurdle_threshold = 0.32
-        high_hurdle_threshold = 0.45
-        obstacle_detection_range = 1.5
-        post_contact_proximity_threshold = 0.5
-        contact_force_penalty_scaling = 50.0
-        max_contact_force_penalty = 2.0
-        enable_contact_force_logging = True
-        obstacle_safe_distance = 1.0
-        max_leg_width = 0.5
-        target_leg_width_near_hurdle = 0.3
-        leg_width_detection_range = 3.0
-        guidance_detection_range = 3.0
-        jump_height_target = 0.42
-        foot_clearance_margin = 0.05
-        foot_clearance_front_window = 0.35
-        foot_clearance_rear_window = 0.4
-        foot_clearance_sigmoid_k = 35.0
-        foot_clearance_tolerance = 0.05
-        foot_drag_window = 0.3
-        rear_follow_window = 0.35
-        rear_follow_front_clearance = 0.05
-        progress_speed_trapezoid = [0.18, 0.4, 0.75, 1.05]
-        progress_heading_tolerance = 0.35
-        approach_speed_trapezoid = [0.12, 0.35, 0.7, 1.05]
-        approach_distance_trapezoid = [1.6, 1.0, 0.45, 0.15]
-        alignment_detection_range = 2.0
-        y_alignment_tolerance = 0.15
-        yaw_alignment_tolerance = 0.3
-        low_guidance_tolerance = 0.20
-        high_guidance_tolerance = 0.15
-        preload_height_drop = 0.08
-        preload_window = [
-            1.2,
-            0.4,
-        ]
-        clearance_window = 0.30
-        post_landing_window = [0.8, 0.1]
-        clearance_margin = 0.05
+        progress_speed_trapezoid = [0.18, 0.4, 0.75, 1.05]  # 前进速度梯形参数
+        progress_heading_tolerance = 0.35  # 前进方向容差（弧度）
+        base_height_target = 0.15  # 遇到高障碍时的低姿态目标高度（米）
+        base_height_normal = 0.45  # 平地或正常移动的基座高度（米）
+        jump_height_target = 0.7  # 面对低障碍时的抬升目标高度（米）
+        obstacle_detection_range = 1.0  # 前方障碍检测范围（米）
+        base_height_high_threshold = 0.35  # 判断高障碍的高度阈值（米）
+        base_height_strategy_gain = 6.0  # 高度策略的指数塑形增益
+
+        high_hurdle_threshold = 0.35  # 兼容旧逻辑使用的高障碍阈值（米）
+        centerline_tolerance = 0.25  # 赛道中心线容忍度（米）
+        feet_clearance_height = 0.15  # 障碍附近脚部最低安全高度（米）
+        feet_clearance_window = 0.80  # 判定靠近障碍的窗口（米）
+        feet_air_time_target = 0.24  # 理想腾空时间（秒）
+        feet_air_time_tolerance = 0.12  # 腾空时间容忍区间（秒）
 
     class commands(LeggedRobotCfg.commands):
-        curriculum = True
+        curriculum = False
         num_commands = 4
         resampling_time = 6.0
         heading_command = True
         lin_vel_clip = 0.1
-        curriculum_success_fraction = 0.35
-        curriculum_success_threshold = 0.45
-        curriculum_goal_threshold = 0.4
 
         class ranges:
-            lin_vel_x = [0.25, 0.85]
+            lin_vel_x = [0.2, 1.0]
             lin_vel_y = [0.0, 0.0]
             ang_vel_yaw = [0, 0]
             heading = [0, 0]
@@ -203,41 +116,6 @@ class GalileoParkourCfg(LeggedRobotCfg):
 
         class crclm_incremnt(LeggedRobotCfg.commands.crclm_incremnt):
             lin_vel_x = 0.03
-
-    class curriculum:
-        """
-        速度课程配置（4阶段速度课程）
-
-        注意：此课程系统只控制速度指令范围，不控制地形。
-        地形由 terrain.py 和 _update_terrain_curriculum() 控制。
-        """
-
-        enabled = False
-        evaluation_window = 80
-
-        # 阶段1：平地推进
-        stage1_name = "平地推进"
-        stage1_vel_range = [0.25, 0.45]  # 速度范围 [m/s]
-        stage1_success_threshold = 0.7  # 成功率阈值（用于进阶判断）
-        stage1_min_iterations = 60  # 最少训练迭代次数
-
-        # 阶段2：双杆切入
-        stage2_name = "双杆切入"
-        stage2_vel_range = [0.3, 0.55]
-        stage2_success_threshold = 0.72
-        stage2_min_iterations = 80
-
-        # 阶段3：三杆节奏
-        stage3_name = "三杆节奏"
-        stage3_vel_range = [0.32, 0.60]
-        stage3_success_threshold = 0.73
-        stage3_min_iterations = 100
-
-        # 阶段4：竞赛四杆
-        stage4_name = "竞赛四杆"
-        stage4_vel_range = [0.35, 0.80]
-        stage4_success_threshold = 0.75
-        stage4_min_iterations = 140
 
     class depth(LeggedRobotCfg.depth):
         use_camera = False
